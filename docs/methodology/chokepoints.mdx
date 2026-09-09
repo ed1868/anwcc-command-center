@@ -111,7 +111,10 @@ only: hazard enrichment does not change `currentMbd`, `flowRatio`, or the
 ## Score Badge
 
 The public `status` field on `ChokepointInfo` is a traffic-light score badge:
-`green`, `yellow`, or `red`. It is not an operational closure-state label.
+`green`, `yellow`, or `red`. It summarizes disruption risk; it is not an
+operational declaration that a waterway is open, restricted, or closed. Detail
+pages report observed transit activity when it is available and state when
+source coverage is too partial to verify operational passage status.
 
 The score is:
 
@@ -128,9 +131,15 @@ Where:
 - `warningComponent = min(15, activeWarnings * 5)`.
 - `aisComponent = min(15, maxCongestionSeverity * 5)`, where low/elevated/high
   AIS congestion severity maps to 1/2/3.
-- `anomalyBonus = 10` only when transit history shows a 50% or larger traffic
-  drop against the prior 30-day transit-count baseline and the threat level is
-  `war_zone` or `critical`.
+- `anomalyBonus = 10` only when PortWatch daily transit history shows a 50% or
+  larger traffic drop against the prior 30-day transit-count baseline and the
+  threat level is `war_zone` or `critical`.
+
+Those four terms are the whole formula. AIS event counts, relay transit counts,
+and PortWatch week-over-week movement are published as context and never enter
+the score. PortWatch feeds both sides: `anomalyBonus` reads its daily transit
+history through `supply_chain:portwatch:v1`, while the week-over-week figure is
+presentation only.
 
 The score badge thresholds are:
 

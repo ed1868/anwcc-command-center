@@ -58,6 +58,7 @@ import {
   shouldExitNonZero as shouldExitOnBriefFailures,
 } from './lib/brief-compose.mjs';
 import {
+  carouselUrlsFrom,
   digestWindowStartMs,
   pickWinningCandidateWithPool,
   readTimeAgeCutoffMs,
@@ -1256,31 +1257,6 @@ function truncateTelegramHtml(html, limit = TELEGRAM_MAX_LEN) {
 }
 
 /**
- * Phase 8: derive the 3 carousel image URLs from a signed magazine
- * URL. The HMAC token binds (userId, issueSlot), not the path — so
- * the same token verifies against /api/brief/{u}/{slot}?t=T AND against
- * /api/brief/carousel/{u}/{slot}/{0|1|2}?t=T.
- *
- * Returns null when the magazine URL doesn't match the expected shape
- * — caller falls back to text-only delivery.
- */
-function carouselUrlsFrom(magazineUrl) {
-  try {
-    const u = new URL(magazineUrl);
-    const m = u.pathname.match(/^\/api\/brief\/([^/]+)\/(\d{4}-\d{2}-\d{2}-\d{4})\/?$/);
-    if (!m) return null;
-    const [, userId, issueSlot] = m;
-    const token = u.searchParams.get('t');
-    if (!token) return null;
-    return [0, 1, 2].map(
-      (p) => `${u.origin}/api/brief/carousel/${userId}/${issueSlot}/${p}?t=${token}`,
-    );
-  } catch {
-    return null;
-  }
-}
-
-/**
  * Send the 3-image brief carousel to a Telegram chat via sendMediaGroup.
  * Telegram fetches each URL server-side, so our carousel edge function
  * has to be publicly reachable (it is — HMAC is the only credential).
@@ -1663,7 +1639,11 @@ async function composeBriefsForRun(rules, nowMs) {
   // was far worse than a brief with dashes on the stats page.)
   let insightsNumbers = { clusters: 0, multiSource: 0 };
   try {
-    const insightsRaw = await readRawJsonFromUpstash(INSIGHTS_KEY);
+    // raw = true pins the bare-key read (#7674): the seeder fleet publishes
+    // bare rows and must keep doing so even if VERCEL_ENV ever leaks into
+    // this container's runtime. The api readers of this key are hard-locked
+    // raw too (api/latest-brief.ts and the brief routes).
+    const insightsRaw = await readRawJsonFromUpstash(INSIGHTS_KEY, 3_000, true);
     if (insightsRaw) insightsNumbers = extractInsights(insightsRaw).numbers;
   } catch (err) {
     console.warn('[digest] brief: insights read failed, using zeroed stats:', err.message);
@@ -2137,10 +2117,13 @@ async function composeAndStoreBriefForUser(userId, annotated, insightsNumbers, d
   // One SET per compose is cheap and always current.
   const latestPointerKey = `brief:latest:${userId}`;
   const latestPointerValue = JSON.stringify({ issueSlot });
+  // raw = true pins the bare-key write (#7674): the digest composer publishes
+  // the envelopes every api/brief reader resolves raw; see the insights read
+  // above for the VERCEL_ENV-leak rationale.
   const pipelineResult = await redisPipeline([
     ['SETEX', key, String(BRIEF_TTL_SECONDS), JSON.stringify(finalEnvelope)],
     ['SETEX', latestPointerKey, String(BRIEF_TTL_SECONDS), latestPointerValue],
-  ]);
+  ], 5_000, true);
   if (!pipelineResult || !Array.isArray(pipelineResult) || pipelineResult.length < 2) {
     throw new Error('null pipeline response from Upstash');
   }
@@ -2408,7 +2391,10 @@ async function main() {
     }
 
     const ruleChannelSet = new Set(rule.channels ?? []);
-    const deliverableChannels = channels.filter(ch => ruleChannelSet.has(ch.channelType) && ch.verified);
+    const deliverableChannels = channels.filter(ch =>
+      ruleChannelSet.has(ch.channelType) && ch.verified &&
+      (ch.channelType !== 'email' || ch.emailOwnership === 'verified_account') &&
+      (ch.channelType !== 'telegram' || ch.telegramOwnership === 'verified_callback'));
     if (deliverableChannels.length === 0) {
       console.log(`[digest] No deliverable channels for ${rule.userId} — skipping`);
       continue;

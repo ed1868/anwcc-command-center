@@ -11,6 +11,7 @@
 //   use SHAPE — default CRS is EPSG:3005). Dataset licence: OGL-BC.
 
 import { CHROME_UA } from '../_seed-utils.mjs';
+import { decodeHtmlEntities } from '../_html-entities.mjs';
 
 export const BC_OPENMAPS_HOST = 'openmaps.gov.bc.ca';
 export const BC_FIRE_LAYER = 'PROT_CURRENT_FIRE_PNTS_SP';
@@ -111,13 +112,7 @@ export function stableBcFireId(props = {}, coords = {}) {
 }
 
 function decodeXml(text) {
-  return String(text || '')
-    .replace(/&amp;/g, '&')
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>')
-    .replace(/&quot;/g, '"')
-    .replace(/&apos;/g, "'")
-    .trim();
+  return decodeHtmlEntities(text).trim();
 }
 
 function xmlField(block, name) {
@@ -628,9 +623,9 @@ export async function mergeWildfireSourcesWithBc({ fetchFirms, fetchCwfis, fetch
     const firmsErr = firmsResult.reason?.message || firmsResult.reason;
     const cwfisErr = cwfisResult.reason?.message || cwfisResult.reason;
     const bcErr = bcResult.reason?.message || bcResult.reason;
-    throw new BcFirePointsError(
+    throw Object.assign(new BcFirePointsError(
       `All wildfire upstreams failed (firms: ${firmsErr}; cwfis: ${cwfisErr}; bc-wildfire: ${bcErr})`,
-    );
+    ), { nonRetryable: true });
   }
   if (!firmsOk) {
     // Distinguish the two failure shapes: a rejected fetch has a reason, a
@@ -669,6 +664,7 @@ export async function mergeWildfireSourcesWithBc({ fetchFirms, fetchCwfis, fetch
     _cwfisPrescribedCount: cwfisOk ? (cwfisResult.value?._cwfisPrescribedCount ?? null) : null,
     _cwfisState: cwfisState,
     _cwfisErrorCode: cwfisErrorCode,
+    _cwfisSnapshot: cwfisOk ? cwfisResult.value?._cwfisSnapshot : cwfisResult.reason?._cwfisSnapshot,
     _bcCount: bcDetections.length,
     _bcEnrichedCount: merged._bcEnrichedCount,
     _bcAppendedCount: merged._bcAppendedCount,
@@ -678,7 +674,37 @@ export async function mergeWildfireSourcesWithBc({ fetchFirms, fetchCwfis, fetch
   };
 }
 
-export function canadianWildfireAfterPublish(data) {
+export function hasCompleteWorldwideWildfireCoverage(data) {
+  return Array.isArray(data?.fireDetections)
+    && data.fireDetections.length > 0
+    && data?._firmsState === 'ok'
+    && data?._firmsPartial !== true;
+}
+
+export function wildfirePublishData(data) {
+  const { _cwfisSnapshot, ...publicData } = data;
+  return publicData;
+}
+
+function nextIdenticalSourceFailureCount(previousMeta, errorCode) {
+  // A missing or unreadable predecessor cannot prove this is the first failure.
+  // Fail closed so a transient seed-meta read error cannot restart the grace
+  // window while the same partial-coverage incident continues.
+  if (!previousMeta || typeof previousMeta !== 'object') return 2;
+  const previousCode = previousMeta?.lastSourceFailureCode ?? previousMeta?.errorCode;
+  if (previousCode !== errorCode) return 1;
+  if (Number.isInteger(previousMeta?.consecutiveSourceFailures)
+    && previousMeta.consecutiveSourceFailures >= 1) {
+    return Math.min(previousMeta.consecutiveSourceFailures + 1, 100);
+  }
+  // Metadata written before the streak fields shipped already represents one
+  // observed failure. Count the next identical run as the second failure so a
+  // rollout cannot turn an active production warning green.
+  if (previousMeta?.sourceState === 'degraded' && previousMeta?.errorCode === errorCode) return 2;
+  return 1;
+}
+
+export function canadianWildfireAfterPublish(data, { previousMeta = null } = {}) {
   const cwfisFailed = data?._cwfisState !== 'ok';
   const bcFailed = data?._bcState !== 'ok';
   // FIRMS is the GLOBAL source for this key. Losing it drops the canonical
@@ -696,11 +722,14 @@ export function canadianWildfireAfterPublish(data) {
   // outage and above healthy: report it rather than let the surviving regions
   // stand in for the globe unremarked.
   if (firmsPartial && !firmsFailed && failureCount === 0) {
+    const errorCode = 'FIRMS_PARTIAL_COVERAGE';
     return {
       freshnessMetaPatch: {
         sourceState: 'degraded',
-        errorCode: 'FIRMS_PARTIAL_COVERAGE',
+        errorCode,
         canadaSourceFailureCount: 0,
+        consecutiveSourceFailures: nextIdenticalSourceFailureCount(previousMeta, errorCode),
+        lastSourceFailureCode: errorCode,
       },
     };
   }
@@ -721,11 +750,27 @@ export function canadianWildfireAfterPublish(data) {
   } else if (failureCount === 1) {
     errorCode = 'BC_WILDFIRE_SOURCE_FAILED';
   }
+  const snapshot = data?._cwfisSnapshot;
+  const cwfisFailure = errorCode === 'CWFIS_SOURCE_FAILED' && !firmsPartial && snapshot
+    ? {
+        failedSources: ['cwfis'],
+        sourceHealth: {
+          cwfis: {
+            lastSuccessAt: snapshot.fetchedAt,
+            consecutiveFailures: snapshot.consecutiveFailures,
+            firstFailureAt: snapshot.firstFailureAt,
+            retainedUntil: snapshot.retainedUntil,
+          },
+        },
+        lastSourceAttemptAt: snapshot.lastAttemptAt,
+      }
+    : { failedSources: [], sourceHealth: {}, lastSourceAttemptAt: null };
   return {
     freshnessMetaPatch: {
       sourceState: 'degraded',
       errorCode,
       canadaSourceFailureCount: failureCount,
+      ...cwfisFailure,
     },
   };
 }

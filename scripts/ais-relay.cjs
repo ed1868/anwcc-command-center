@@ -25,6 +25,7 @@ const crypto = require('crypto');
 const v8 = require('v8');
 const { WebSocketServer, WebSocket } = require('ws');
 const { parseProxyConfig, resolveProxyString, resolveProxyStringForAttempt } = require('./_proxy-utils.cjs');
+const { parseWidgetAgentResponse } = require('./_widget-response-parser.cjs');
 const {
   cooldownKeyForAccount,
   OPENSKY_LEGACY_COOLDOWN_KEY,
@@ -50,7 +51,7 @@ const {
 } = require('./lib/llm-model-policy.cjs');
 const xNewsAccounts = require('./lib/x-news-accounts.cjs');
 const { createPollGenerationGuard } = require('./lib/poll-generation-guard.cjs');
-const { createXPollCycle } = require('./lib/x-poll-cycle.cjs');
+const { createXPollCycle, xPollSlot } = require('./lib/x-poll-cycle.cjs');
 const {
   createXPostBudget,
   DEFAULT_X_CURATED_DAILY_COVERAGE_POSTS,
@@ -2084,12 +2085,14 @@ function startTelegramPollLoop() {
 
 // ─────────────────────────────────────────────────────────────
 // Curated X news-account monitoring (Track A / #6654)
-// Official X API user-timeline + since_id. Cadence 5–15 min.
-// Requires env: X_BEARER_TOKEN (same Bearer as company-monitoring-worker).
+// One public X List page in each fixed 15-minute UTC slot.
+// Requires the app bearer and the verified public List ID.
 // ─────────────────────────────────────────────────────────────
 const X_BEARER_TOKEN = String(process.env.X_BEARER_TOKEN || '').trim();
-const X_ENABLED = Boolean(X_BEARER_TOKEN);
-const X_POLL_INTERVAL_MS = xNewsAccounts.clampPollIntervalMs(process.env.X_POLL_INTERVAL_MS || xNewsAccounts.DEFAULT_POLL_INTERVAL_MS);
+const X_CURATED_LIST_ID = String(process.env.X_CURATED_LIST_ID || '').trim();
+const X_CURATED_LIST_CONFIGURED = /^[1-9]\d{0,18}$/.test(X_CURATED_LIST_ID);
+const X_ENABLED = Boolean(X_BEARER_TOKEN && X_CURATED_LIST_CONFIGURED);
+const X_POLL_INTERVAL_MS = 15 * 60 * 1000;
 // `Number('abc')` is NaN, and Math.max(50, NaN) is NaN — which reaches
 // mergeAndDedup as `.slice(0, NaN)` and silently publishes an EMPTY feed every
 // cycle with no error anywhere. Coerce non-numeric env values to the default.
@@ -2102,19 +2105,14 @@ const X_FEED_POLL_STATE_KEY = 'intelligence:x-feed:poll-state:v1';
 const X_FEED_POLL_LOCK_KEY = 'intelligence:x-feed:poll-lock:v1';
 const X_FEED_TTL_SECONDS = 5400;
 const X_FEED_META_TTL_SECONDS = 3600;
-const X_FEED_POLL_LOCK_TTL_SECONDS = Math.ceil((X_POLL_INTERVAL_MS + 120_000) / 1000);
-// The stuck-poll abort has to fire while the Redis lease above is still HELD,
-// and the guard only re-evaluates when a scheduled tick calls it. A threshold at
-// or above the cadence therefore pushes the first evaluation out to 2x the
-// cadence — well past the lease TTL — so between TTL expiry and that tick this
-// replica keeps issuing requests on a lapsed lease while a peer's SETNX
-// succeeds: both drain the shared bearer's quota and both write the whole cursor
-// map. Sitting a minute under the cadence (clamped to 5-15min, so 4-14min here)
-// makes the very next tick abort the run, with the lease still ours to release.
-// Derived from the same constant as the TTL so the invariant
-// X_POLL_STUCK_AFTER_MS < X_POLL_INTERVAL_MS < X_FEED_POLL_LOCK_TTL_SECONDS * 1000
-// cannot drift the way two independently tuned literals can.
-const X_POLL_STUCK_AFTER_MS = X_POLL_INTERVAL_MS - 60_000;
+// Two bounded 15-second X calls plus Redis work fit inside two minutes. A short
+// lease lets another replica recover at the next quarter-hour boundary after an
+// owner crash instead of losing two slots to the old cadence-sized lease.
+const X_FEED_POLL_LOCK_TTL_SECONDS = 120;
+// The process-local guard is checked on each scheduled boundary. If a request
+// somehow outlives the normal timeout, the next boundary aborts that generation
+// before it starts a replacement run.
+const X_POLL_STUCK_AFTER_MS = 60_000;
 const xPostBudget = createXPostBudget({
   evalCommand: upstashEval,
   dailyCoveragePosts: DEFAULT_X_CURATED_DAILY_COVERAGE_POSTS,
@@ -2122,18 +2120,21 @@ const xPostBudget = createXPostBudget({
 
 const xState = {
   accounts: [],
-  cursorByAccountId: Object.create(null),
-  accountIdByHandle: Object.create(null),
-  lastPolledAtByHandle: Object.create(null),
+  lastMembershipCheckAt: 0,
   items: [],
   lookupOffset: 0,
-  accountOffset: 0,
   // Persisted snapshot version, published to Redis and to /status. NOT the poll
   // guard's run counter — see xPollGeneration below for why the two must stay
   // apart.
   generation: 0,
   lastPollAt: 0,
   lastHealthyAt: 0,
+  lastAttemptAt: 0,
+  lastProviderSuccessAt: 0,
+  lastAcceptedPublicationAt: 0,
+  lastAttemptSlot: null,
+  lastProviderSuccessSlot: null,
+  lastPublishedSlot: null,
   lastCoverage: null,
   lastError: null,
   rateLimitedUntil: 0,
@@ -2160,18 +2161,15 @@ let xPollGeneration = 0;
 
 function loadXAccounts() {
   const p = path.join(__dirname, '..', 'data', 'x-accounts.json');
-  const set = String(process.env.X_CHANNEL_SET || '').trim().toLowerCase();
   try {
     const raw = JSON.parse(readFileSync(p, 'utf8'));
     const enabledTotal = xNewsAccounts.countEnabledAccounts(raw);
     if (enabledTotal > X_TRACK_A_ACCOUNT_BUDGET) {
       console.warn(`[Relay] X registry has ${enabledTotal} enabled accounts; Track A budget is ~${X_TRACK_A_ACCOUNT_BUDGET}. Re-run spend math before growing the set.`);
     }
-    xState.accounts = set
-      ? xNewsAccounts.loadXAccounts(raw, { set })
-      : xNewsAccounts.loadXAccounts(raw);
+    xState.accounts = xNewsAccounts.loadXAccounts(raw);
     if (!xState.accounts.length) {
-      console.warn(`[Relay] X account set "${set || 'all'}" is empty — no accounts to poll`);
+      console.warn('[Relay] X account registry is empty — no accounts to poll');
     }
     return xState.accounts;
   } catch (e) {
@@ -2206,6 +2204,8 @@ const xPollCycle = createXPollCycle({
   randomId: () => crypto.randomBytes(4).toString('hex'),
   X_ENABLED,
   X_BEARER_TOKEN,
+  X_CURATED_LIST_ID,
+  X_POLL_INTERVAL_MS,
   X_FEED_CACHE_KEY,
   X_FEED_META_KEY,
   X_FEED_POLL_STATE_KEY,
@@ -2234,32 +2234,40 @@ const xPollGuard = createPollGenerationGuard({
 });
 
 function guardedXPoll(retryAfterLeaseConflict = false) {
-  xPollGuard.run({ retryAfterLeaseConflict });
+  return xPollGuard.run({ retryAfterLeaseConflict });
 }
 
 async function startXPollLoop() {
   loadXAccounts();
   await xPollCycle.hydrate();
   if (!X_ENABLED) {
-    console.warn('[Relay] X news-account poll skipped — X_BEARER_TOKEN is not configured on ais-relay');
+    const missing = [
+      !X_BEARER_TOKEN ? 'X_BEARER_TOKEN' : null,
+      !X_CURATED_LIST_CONFIGURED ? 'valid X_CURATED_LIST_ID' : null,
+    ].filter(Boolean);
+    xState.lastError = `X List poll disabled: missing ${missing.join(' and ')}`;
+    console.warn(`[Relay] ${xState.lastError}`);
     return;
   }
+  const slot = xPollSlot(Date.now(), X_POLL_INTERVAL_MS);
   const nextDueAt = Math.max(
-    xState.lastPollAt ? xState.lastPollAt + X_POLL_INTERVAL_MS : 0,
+    xState.lastAttemptSlot === slot.id ? slot.endsAt : Date.now(),
     xState.rateLimitedUntil || 0,
   );
   const startupDelayMs = Math.max(0, nextDueAt - Date.now());
-  const startInterval = () => {
-    guardedXPoll();
-    setInterval(guardedXPoll, X_POLL_INTERVAL_MS).unref?.();
+  const pollAndScheduleNextSlot = () => {
+    const started = guardedXPoll();
+    const activeSlot = xPollSlot(Date.now(), X_POLL_INTERVAL_MS);
+    const delayMs = started ? Math.max(1000, activeSlot.endsAt - Date.now()) : 1000;
+    setTimeout(pollAndScheduleNextSlot, delayMs).unref?.();
   };
   if (startupDelayMs > 0) {
-    const timer = setTimeout(startInterval, startupDelayMs);
+    const timer = setTimeout(pollAndScheduleNextSlot, startupDelayMs);
     timer.unref?.();
   } else {
-    startInterval();
+    pollAndScheduleNextSlot();
   }
-  console.log(`[Relay] X poll loop started (${Math.round(X_POLL_INTERVAL_MS / 60000)} min cadence)`);
+  console.log('[Relay] X List poll loop started (fixed 15-minute UTC slots)');
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -3183,33 +3191,32 @@ const YAHOO_ONLY = new Set([
   ...COMMODITY_SYMBOLS.filter(s => s.endsWith('=X')),
 ]);
 
+// CommonJS cannot import finiteObservation from _seed-utils.mjs. The relay test
+// keeps this boundary guard aligned with the cron seeder.
+function _finiteObservation(value) {
+  if (typeof value !== 'number' && (typeof value !== 'string' || !value.trim())) return null;
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+
 function _parseYahooChartJson(body) {
   try {
     const data = JSON.parse(body);
     const result = data?.chart?.result?.[0];
     const meta = result?.meta;
     if (!meta) return null;
-    const price = meta.regularMarketPrice;
-    const prevClose = meta.chartPreviousClose || meta.previousClose || price;
+    const price = _finiteObservation(meta.regularMarketPrice);
+    if (price == null) return null;
+    const prevClose = [meta.chartPreviousClose, meta.previousClose]
+      .map(_finiteObservation)
+      .find((value) => value != null && value !== 0) ?? price;
     const change = prevClose ? ((price - prevClose) / prevClose) * 100 : 0;
-    // Round to 7 significant digits like the cron seeders' roundSparkline
-    // (_seed-utils.mjs). Raw float64 noise made these FAST-tier keys ~2x the
-    // rounded size, and whichever writer wins the relay/cron race decides
-    // what every visitor downloads on cold load.
-    //
-    // The guard below MIRRORS toSignificantDigits in _seed-utils.mjs exactly:
-    // non-numbers, non-finite values and 0 pass through untouched so a malformed
-    // upstream degrades identically on both writers. Without it a string close
-    // ("N/A") becomes NaN and serialises to null, denting the curve on the relay
-    // path only. CJS cannot import the ESM helper, so the copy is deliberate and
-    // tests/ais-relay-sparkline-precision.test.mjs pins the two in lockstep.
     const closes = result.indicators?.quote?.[0]?.close;
     const sparkline = Array.isArray(closes)
-      ? closes.filter((v) => v != null).map((v) => (
-        typeof v === 'number' && Number.isFinite(v) && v !== 0
-          ? Number(v.toPrecision(7))
-          : v
-      ))
+      ? closes
+        .map(_finiteObservation)
+        .filter((value) => value != null)
+        .map((value) => (value !== 0 ? Number(value.toPrecision(7)) : value))
       : [];
     return { price, change, sparkline };
   } catch { return null; }
@@ -6111,10 +6118,16 @@ async function seedWeatherAlerts() {
       maxBytes: SWIC_MAX_BYTES,
     });
 
+    const sourceSuccessAt = {};
+    const fetchSource = async (source, fetchFn) => {
+      const value = await fetchFn();
+      sourceSuccessAt[source] = Date.now();
+      return value;
+    };
     const [nwsResult, ecccResult, swicResult] = await Promise.allSettled([
-      fetchNwsFeatures(),
-      fetchEcccFeatures(),
-      fetchSwicCatalog(),
+      fetchSource('nws', fetchNwsFeatures),
+      fetchSource('eccc', fetchEcccFeatures),
+      fetchSource('swic', fetchSwicCatalog),
     ]);
     if (nwsResult.status === 'rejected') {
       console.warn(`[Weather] NWS fetch failed: ${nwsResult.reason?.message || nwsResult.reason}`);
@@ -6125,10 +6138,9 @@ async function seedWeatherAlerts() {
     if (swicResult.status === 'rejected') {
       console.warn(`[Weather] SWIC fetch failed: ${swicResult.reason?.message || swicResult.reason}`);
     }
-    if (nwsResult.status === 'rejected' && ecccResult.status === 'rejected' && swicResult.status === 'rejected') {
-      console.warn('[Weather] Seed failed: NWS, ECCC, and SWIC fetches all failed');
-      return;
-    }
+    const results = { nws: nwsResult, eccc: ecccResult, swic: swicResult };
+    const failedSources = Object.keys(results).filter((source) => results[source].status === 'rejected');
+    const attemptedAt = Date.now();
 
     const nwsFeatures = nwsResult.status === 'fulfilled' ? nwsResult.value : [];
     const nwsAlerts = nwsResult.status === 'fulfilled'
@@ -6151,9 +6163,21 @@ async function seedWeatherAlerts() {
     let carriedNws = [];
     let carriedEccc = [];
     let carriedSwic = [];
-    if (nwsResult.status === 'rejected' || ecccResult.status === 'rejected' || swicResult.status === 'rejected') {
-      const prev = await envelopeRead(WEATHER_REDIS_KEY, () => null);
-      const prevAlerts = Array.isArray(prev?.alerts) ? prev.alerts : [];
+    let previousMeta = null;
+    let previousPayloadAt = null;
+    if (failedSources.length > 0) {
+      const [raw, meta] = await Promise.all([
+        upstashGet(WEATHER_REDIS_KEY, () => null),
+        upstashGet('seed-meta:weather:alerts', () => null),
+      ]);
+      previousMeta = meta;
+      // Inspect the envelope clock as well as its data: the two writes can fail independently.
+      const enveloped = raw && typeof raw === 'object' && !Array.isArray(raw) && '_seed' in raw && 'data' in raw;
+      const prev = enveloped ? raw.data : raw;
+      previousPayloadAt = enveloped ? raw._seed?.fetchedAt : null;
+      // Failed providers cannot tell us which alerts ended since the last fetch.
+      const prevAlerts = (Array.isArray(prev?.alerts) ? prev.alerts : [])
+        .filter((alert) => Date.parse(alert?.expires) > attemptedAt);
       if (nwsResult.status === 'rejected') carriedNws = prevAlerts.filter((a) => a?.source === 'nws');
       if (ecccResult.status === 'rejected') carriedEccc = prevAlerts.filter((a) => a?.source === 'eccc');
       if (swicResult.status === 'rejected') carriedSwic = prevAlerts.filter((a) => a?.source === 'swic');
@@ -6167,32 +6191,55 @@ async function seedWeatherAlerts() {
       eccc: ecccResult.status === 'fulfilled' ? ecccAlerts : carriedEccc,
       swic: swicResult.status === 'fulfilled' ? swicAlerts : carriedSwic,
     });
+    const sourceHealth = Object.fromEntries(Object.keys(results).map((source) => {
+      if (results[source].status === 'fulfilled') {
+        return [source, { lastSuccessAt: sourceSuccessAt[source], consecutiveFailures: 0, firstFailureAt: null, retainedUntil: null }];
+      }
+      const previous = previousMeta?.sourceHealth?.[source];
+      const known = previousMeta?.status !== 'error'
+        && Number.isSafeInteger(previousPayloadAt) && previousPayloadAt > 0
+        && previousPayloadAt === previousMeta?.fetchedAt
+        && Number.isSafeInteger(previous?.consecutiveFailures) && previous.consecutiveFailures >= 0;
+      const retained = alerts.filter((alert) => alert.source === source);
+      return [source, {
+        lastSuccessAt: previous?.lastSuccessAt ?? null,
+        consecutiveFailures: known ? Math.min(previous.consecutiveFailures + 1, 100) : null,
+        firstFailureAt: known && previous.consecutiveFailures === 0 ? attemptedAt : (previous?.firstFailureAt ?? null),
+        retainedUntil: retained.length > 0 ? Math.min(...retained.map((alert) => Date.parse(alert.expires))) : null,
+      }];
+    }));
+    const sourceMeta = {
+      sourceHealth,
+      lastSourceAttemptAt: attemptedAt,
+      ...(failedSources.length > 0
+        ? { sourceState: 'degraded', errorCode: 'WEATHER_ALERT_SOURCE_INCOMPLETE', failedSources }
+        : { sourceState: 'ok' }),
+    };
+    if (failedSources.length === 3) {
+      await upstashSet('seed-meta:weather:alerts', {
+        fetchedAt: previousMeta?.fetchedAt ?? 0,
+        recordCount: previousMeta?.recordCount ?? 0,
+        ...sourceMeta,
+      }, 604800);
+      console.warn('[Weather] Seed failed: NWS, ECCC, and SWIC fetches all failed');
+      return;
+    }
 
     // Always write the merged active set (#6607 purge). Do not skip overwrite
     // when a live source returns 0 — that would leave ended CA alerts cached.
     const payload = { alerts };
+    const publishedAt = Date.now();
     const ok1 = await envelopeWrite(WEATHER_REDIS_KEY, payload, WEATHER_CACHE_TTL, {
+      fetchedAt: publishedAt,
       recordCount: alerts.length,
       sourceVersion: WEATHER_ALERTS_SOURCE_VERSION,
       zeroOk: true,
     });
-    // A permanently dead source must be visible to /api/health. Without a
-    // sourceState the seed-meta stays fresh forever and the outage is invisible.
-    const failedSources = [
-      nwsResult.status === 'rejected' ? 'nws' : null,
-      ecccResult.status === 'rejected' ? 'eccc' : null,
-      swicResult.status === 'rejected' ? 'swic' : null,
-    ].filter(Boolean);
     const ok2 = await upstashSet('seed-meta:weather:alerts', {
-      fetchedAt: Date.now(),
+      fetchedAt: publishedAt,
       recordCount: alerts.length,
-      ...(failedSources.length > 0
-        ? {
-          sourceState: 'degraded',
-          errorCode: 'WEATHER_ALERT_SOURCE_INCOMPLETE',
-          failedSources,
-        }
-        : { sourceState: 'ok' }),
+      ...sourceMeta,
+      ...(!ok1 ? { status: 'error' } : {}),
     }, 604800);
     console.log(`[Weather] Seeded ${alerts.length} alerts (nws=${nwsAlerts.length} eccc=${ecccAlerts.length} swic=${swicAlerts.length}, redis: ${ok1 && ok2 ? 'OK' : 'PARTIAL'}) in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
     // Which high-severity alerts this tick notifies on. Distinct families,
@@ -7469,7 +7516,9 @@ async function seedSocialVelocity() {
       for (const p of posts) {
         // Deduplicate cross-subreddit reposts of the same article URL.
         const articleUrl = p.url || '';
-        const isExternal = articleUrl && !articleUrl.includes('reddit.com');
+        let articleHostname = '';
+        try { articleHostname = new URL(articleUrl).hostname; } catch { /* invalid URLs are not deduplicated */ }
+        const isExternal = articleHostname && articleHostname !== 'reddit.com' && !articleHostname.endsWith('.reddit.com');
         if (isExternal && seenUrls.has(articleUrl)) continue;
         if (isExternal) seenUrls.add(articleUrl);
         const ageSec = Math.max(1, nowSec - (p.created_utc || nowSec));
@@ -8777,6 +8826,14 @@ const MAX_VESSEL_META = 50000;
 
 const vessels = new Map();
 const vesselHistory = new Map();
+// mmsi → timestamp of the vessel's most recent position fix. Retention must
+// exceed GAP_THRESHOLD: the dark-ship return check compares the CURRENT fix
+// against this value, and the vesselHistory equivalent loses the prior fix
+// to its 30-minute DENSITY_WINDOW prune and 10-entry cap long before a >1h
+// silence ends. Bounded by the same retention prune + recency eviction
+// cleanupAggregates applies to vesselHistory.
+const vesselLastFixSeen = new Map();
+const LAST_FIX_RETENTION_MS = 6 * 60 * 60 * 1000; // 6h — 6× GAP_THRESHOLD
 const densityGrid = new Map();
 const candidateReports = new Map();
 // Parallel store for tanker (AIS ship type 80-89) position reports — populated
@@ -8840,6 +8897,17 @@ const TRANSIT_WINDOW_MS = 24 * 60 * 60 * 1000;
 const MIN_DWELL_MS = 5 * 60 * 1000;
 const CHOKEPOINT_TRANSIT_KEY = 'supply_chain:chokepoint_transits:v1';
 const CHOKEPOINT_TRANSIT_TTL = 3600; // 1h — 6x interval; survives ~5 consecutive missed pings
+
+// Dark-ship (AIS gap) count envelope — the trusted producer behind the
+// temporal anomalies `ais_gaps` count source (#7574). Written on its own
+// slow loop, not on the per-snapshot build: detectDisruptions runs every
+// SNAPSHOT_INTERVAL_MS, which would be a Redis write per relay heartbeat.
+const AIS_GAPS_REDIS_KEY = 'maritime:ais-gaps:v1';
+// 60min — must STRICTLY exceed the 30min health maxStaleMin (api/health.js
+// aisGaps entry) so a dead relay reads warn STALE_SEED before the envelope
+// expires to crit EMPTY; 6x the seed interval.
+const AIS_GAPS_TTL = 3600;
+const AIS_GAPS_SEED_INTERVAL_MS = 10 * 60 * 1000;
 const CHOKEPOINT_TRANSIT_INTERVAL_MS = 10 * 60 * 1000;
 
 const NAVAL_PREFIX_RE = /^(USS|USNS|HMS|HMAS|HMCS|INS|JS|ROKS|TCG|FS|BNS|RFS|PLAN|PLA|CGC|PNS|KRI|ITS|SNS|MMSI)/i;
@@ -9095,6 +9163,18 @@ function processPositionReportForSnapshot(data) {
   });
 
   const history = vesselHistory.get(mmsi) || [];
+  // Dark-ship return detection (#7574): a fix arriving more than
+  // GAP_THRESHOLD after the previous one marks the vessel as returned from
+  // extended AIS silence. The prior fix is read from vesselLastFixSeen, NOT
+  // from vesselHistory — cleanupAggregates prunes vesselHistory to the
+  // 30-min DENSITY_WINDOW and caps it at 10 entries, so by the time a >1h
+  // silence ends the old fix is long gone from that structure and a
+  // history-diffing form of this check can never fire.
+  const lastFixAt = vesselLastFixSeen.get(mmsi);
+  if (lastFixAt && now - lastFixAt > GAP_THRESHOLD) {
+    darkShipReturns.set(mmsi, now);
+  }
+  vesselLastFixSeen.set(mmsi, now);
   history.push(now);
   if (history.length > 10) history.shift();
   vesselHistory.set(mmsi, history);
@@ -9181,6 +9261,14 @@ function cleanupAggregates() {
       vesselHistory.set(mmsi, filtered);
     }
   }
+  // Retention prune + recency cap for the dark-ship last-fix map: entries
+  // older than the retention window can never be part of a live >1h silence
+  // comparison again, and the cap bounds memory against vessel churn.
+  const lastFixCutoff = now - LAST_FIX_RETENTION_MS;
+  for (const [mmsi, ts] of vesselLastFixSeen) {
+    if (ts < lastFixCutoff) vesselLastFixSeen.delete(mmsi);
+  }
+  evictMapByTimestamp(vesselLastFixSeen, MAX_VESSEL_HISTORY, (ts) => ts);
   // Hard cap: keep the most recent vessel histories.
   evictMapByTimestamp(vesselHistory, MAX_VESSEL_HISTORY, (history) => history[history.length - 1] || 0);
 
@@ -9269,6 +9357,29 @@ function cleanupAggregates() {
   }
 }
 
+// Vessels seen again after extended AIS silence: mmsi → the return-seen
+// timestamp. Entries are bounded by the 10-minute freshness window in
+// countDarkShips (pruned on read) and the 10-entry vesselHistory cap, so the
+// map cannot grow unbounded even in a flood of simultaneous returns.
+const darkShipReturns = new Map();
+
+/**
+ * Vessels that returned after extended AIS silence and were seen again
+ * within the last 10 minutes — the signal the retired client-side ais_gaps
+ * baseline counted per browser session (#7574). Sightings are recorded at
+ * ingestion (processPositionReportForSnapshot) because cleanupAggregates
+ * prunes vesselHistory to the 30-minute DENSITY_WINDOW, which can never
+ * span the 1-hour GAP_THRESHOLD.
+ */
+function countDarkShips(now = Date.now()) {
+  let darkShipCount = 0;
+  for (const [mmsi, seenAt] of darkShipReturns) {
+    if (now - seenAt >= 10 * 60 * 1000) darkShipReturns.delete(mmsi);
+    else darkShipCount++;
+  }
+  return darkShipCount;
+}
+
 function detectDisruptions() {
   const disruptions = [];
   const now = Date.now();
@@ -9302,17 +9413,7 @@ function detectDisruptions() {
     }
   }
 
-  let darkShipCount = 0;
-  for (const history of vesselHistory.values()) {
-    if (history.length >= 2) {
-      const lastSeen = history[history.length - 1];
-      const secondLast = history[history.length - 2];
-      if (lastSeen - secondLast > GAP_THRESHOLD && now - lastSeen < 10 * 60 * 1000) {
-        darkShipCount++;
-      }
-    }
-  }
-
+  const darkShipCount = countDarkShips(now);
   if (darkShipCount >= 1) {
     disruptions.push({
       id: 'global-gap-spike',
@@ -9538,6 +9639,39 @@ async function seedChokepointTransits() {
   await upstashSet('seed-meta:supply_chain:chokepoint_transits', { fetchedAt: now, recordCount: Object.keys(transits).length }, 604800);
   console.log(`[Transit] Seeded ${Object.keys(transits).length} chokepoint transit counts`);
 }
+
+/**
+ * seedAisGaps publishes the dark-ship count envelope + seed-meta.
+ *
+ * `sampledAt` is the content clock the temporal-anomalies rebuild reads
+ * (gapsContentClock); computing `now` once and threading it through both
+ * writes keeps `_seed.fetchedAt` and seed-meta in agreement (#6775).
+ *
+ * The publish is gated on AIS position freshness: while the aisstream feed
+ * is down or stale the relay cannot observe returns, so publishing a count
+ * (most robusly a zero) would stamp OK on a blind sensor. Skipping BOTH
+ * writes instead lets the 30min health budget age the missing stamp into
+ * STALE_SEED — the honest signal.
+ */
+async function seedAisGaps() {
+  const now = Date.now();
+  if (!getAisPositionFreshness(now).currentPositionReady) {
+    console.log(`[AisGaps] Skipping publish: AIS positions not fresh (ageMs=${getAisPositionFreshness(now).positionAgeMs})`);
+    return;
+  }
+  const darkShips = countDarkShips(now);
+  const envelopeOk = await envelopeWrite(AIS_GAPS_REDIS_KEY, { darkShips, sampledAt: now }, AIS_GAPS_TTL, { fetchedAt: now, recordCount: darkShips, sourceVersion: 'ais-gaps', zeroOk: true });
+  const metaOk = await upstashSet('seed-meta:maritime:ais-gaps', { fetchedAt: now, recordCount: darkShips }, 604800);
+  if (!envelopeOk || !metaOk) {
+    console.warn(`[AisGaps] Seed write FAILED (envelope=${envelopeOk} meta=${metaOk})`);
+    return;
+  }
+  console.log(`[AisGaps] Seeded dark-ship count: ${darkShips}`);
+}
+
+setTimeout(() => {
+  startBootSeedLoop('AisGaps', 'seed-meta:maritime:ais-gaps', AIS_GAPS_SEED_INTERVAL_MS, seedAisGaps, err => console.error('[AisGaps] Initial seed error:', err.message), err => console.error('[AisGaps] Seed error:', err.message));
+}, 30_000);
 
 setTimeout(() => {
   startBootSeedLoop('Transit', 'seed-meta:supply_chain:chokepoint_transits', CHOKEPOINT_TRANSIT_INTERVAL_MS, seedChokepointTransits, err => console.error('[Transit] Initial seed error:', err.message), err => console.error('[Transit] Seed error:', err.message));
@@ -11777,7 +11911,12 @@ const server = http.createServer(async (req, res) => {
         enabled: X_ENABLED,
         accounts: xState.accounts?.length || 0,
         items: xState.items?.length || 0,
+        // lastPollAt is an ACCEPTED-PUBLICATION clock: it advances only when a
+        // List page is validated, settled and published. lastAttemptAt is the
+        // attempt clock this field used to be, kept here so public consumers can
+        // still tell "not polling" from "polling but not accepting".
         lastPollAt: xState.lastPollAt ? new Date(xState.lastPollAt).toISOString() : null,
+        lastAttemptAt: xState.lastAttemptAt ? new Date(xState.lastAttemptAt).toISOString() : null,
         hasError: !!xState.lastError,
         lastError: xState.lastError || null,
         // Distinguishes "Redis unreadable, refusing to publish" from an ordinary
@@ -11828,7 +11967,7 @@ const server = http.createServer(async (req, res) => {
       },
     }));
   } else if (pathname === '/status') {
-    const postBudget = await xPostBudget.status();
+    const postBudget = await xPostBudget.status({ requestedPosts: 5, coverageUnitPosts: 5 });
     return sendCompressed(req, res, postBudget.available ? 200 : 503, {
       'Content-Type': 'application/json',
       'Cache-Control': 'no-store',
@@ -11836,9 +11975,24 @@ const server = http.createServer(async (req, res) => {
       status: xPostBudgetServiceStatus(postBudget),
       xFeed: {
         enabled: X_ENABLED,
+        bearerConfigured: Boolean(X_BEARER_TOKEN),
+        listConfigured: X_CURATED_LIST_CONFIGURED,
         accounts: xState.accounts?.length || 0,
         items: xState.items?.length || 0,
         lastPollAt: xState.lastPollAt ? new Date(xState.lastPollAt).toISOString() : null,
+        lastAttemptAt: xState.lastAttemptAt ? new Date(xState.lastAttemptAt).toISOString() : null,
+        lastProviderSuccessAt: xState.lastProviderSuccessAt
+          ? new Date(xState.lastProviderSuccessAt).toISOString()
+          : null,
+        lastAcceptedPublicationAt: xState.lastAcceptedPublicationAt
+          ? new Date(xState.lastAcceptedPublicationAt).toISOString()
+          : null,
+        lastAttemptSlot: xState.lastAttemptSlot,
+        lastProviderSuccessSlot: xState.lastProviderSuccessSlot,
+        lastPublishedSlot: xState.lastPublishedSlot,
+        lastMembershipCheckAt: xState.lastMembershipCheckAt
+          ? new Date(xState.lastMembershipCheckAt).toISOString()
+          : null,
         lastError: xState.lastError || null,
         coverage: xState.lastCoverage,
         lastHealthyAt: xState.lastHealthyAt ? new Date(xState.lastHealthyAt).toISOString() : null,
@@ -13579,10 +13733,7 @@ async function handleWidgetAgentRequest(req, res) {
       if (response.stop_reason === 'end_turn') {
         const textBlock = response.content.find(b => b.type === 'text');
         const text = textBlock?.text ?? '';
-        const htmlMatch = text.match(/<!--\s*widget-html\s*-->([\s\S]*?)<!--\s*\/widget-html\s*-->/);
-        const html = (htmlMatch?.[1] ?? text).slice(0, maxHtml);
-        const titleMatch = text.match(/<!--\s*title:\s*([^\n]+?)\s*-->/);
-        const title = titleMatch?.[1]?.trim() ?? 'Custom Widget';
+        const { html, title } = parseWidgetAgentResponse(text, maxHtml);
         sendWidgetSSE(res, 'html_complete', { html });
         sendWidgetSSE(res, 'done', { title });
         completed = true;
@@ -13653,11 +13804,10 @@ async function handleWidgetAgentRequest(req, res) {
         const text = Array.isArray(msg.content)
           ? msg.content.filter(b => b.type === 'text').map(b => b.text).join('')
           : String(msg.content ?? '');
-        const htmlMatch = text.match(/<!--\s*widget-html\s*-->([\s\S]*?)<!--\s*\/widget-html\s*-->/);
-        if (htmlMatch?.[1]?.trim()) {
-          const titleMatch = text.match(/<!--\s*title:\s*([^\n]+?)\s*-->/);
-          sendWidgetSSE(res, 'html_complete', { html: htmlMatch[1].slice(0, maxHtml) });
-          sendWidgetSSE(res, 'done', { title: titleMatch?.[1]?.trim() ?? 'Custom Widget' });
+        const parsed = parseWidgetAgentResponse(text, maxHtml);
+        if (parsed.hasHtmlMarkers && parsed.html.trim()) {
+          sendWidgetSSE(res, 'html_complete', { html: parsed.html });
+          sendWidgetSSE(res, 'done', { title: parsed.title });
           recovered = true;
           break;
         }

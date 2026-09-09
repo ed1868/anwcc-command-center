@@ -11,6 +11,12 @@
       "status": "excluded",
       "references": [
         {
+          "path": "scripts/measure-trade-animation-rebuild.mjs"
+        },
+        {
+          "path": "scripts/profile-news-hybrid-clustering-7782-dashboard.mjs"
+        },
+        {
           "path": "src/components/LiveNewsPanel.ts"
         },
         {
@@ -444,9 +450,6 @@
         },
         {
           "path": "scripts/seed-cyber-threats.mjs"
-        },
-        {
-          "path": "server/worldmonitor/cyber/v1/_shared.ts"
         }
       ]
     },
@@ -595,6 +598,9 @@
         },
         {
           "path": "scripts/_r2-storage.mjs"
+        },
+        {
+          "path": "scripts/cloudflare-cache-rule.mjs"
         },
         {
           "path": "scripts/seed-internet-outages.mjs"
@@ -828,6 +834,9 @@
         },
         {
           "path": "scripts/dispatch-stale-railway-reconcile.mjs"
+        },
+        {
+          "path": "scripts/freeze-github-stars.mjs"
         },
         {
           "path": "scripts/resolve-railway-reconcile-control.mjs"
@@ -1397,6 +1406,9 @@
         },
         {
           "path": "scripts/audit-resilience-cohorts.mjs"
+        },
+        {
+          "path": "scripts/capture-seed-recovery.mjs"
         },
         {
           "path": "scripts/check-seed-freshness.mjs"
@@ -3822,6 +3834,9 @@
       "status": "excluded",
       "references": [
         {
+          "path": "scripts/mcp-live-smoke.mjs"
+        },
+        {
           "path": "scripts/openapi-inject-examples.mjs"
         },
         {
@@ -4198,9 +4213,6 @@
       "references": [
         {
           "path": "scripts/seed-cyber-threats.mjs"
-        },
-        {
-          "path": "server/worldmonitor/cyber/v1/_shared.ts"
         }
       ]
     },
@@ -4292,26 +4304,32 @@
           "path": "server/worldmonitor/market/v1/_quote-provider.ts"
         },
         {
-          "path": "server/worldmonitor/market/v1/_shared.ts"
-        },
-        {
           "path": "server/worldmonitor/market/v1/get-insider-transactions.ts"
         }
       ]
     },
     {
       "host": "firms.modaps.eosdis.nasa.gov",
-      "provider": "firms.modaps.eosdis.nasa.gov",
+      "provider": "NASA FIRMS",
       "kind": "structured",
       "observed": true,
-      "license": "Provider terms for this upstream API/dataset; verify before redistribution",
-      "attribution": "Credit firms.modaps.eosdis.nasa.gov and link to the original upstream API/dataset.",
+      "license": "NASA FIRMS provider terms apply; redistribution terms require review",
+      "attribution": "Credit NASA FIRMS and link to the original upstream API or dataset.",
       "status": "terms-review",
       "references": [
         {
-          "path": "scripts/seed-fire-detections.mjs"
+          "path": "scripts/wildfire/firms-area.mjs"
         }
       ]
+    },
+    {
+      "host": "firms2.modaps.eosdis.nasa.gov",
+      "provider": "NASA FIRMS",
+      "kind": "structured",
+      "observed": false,
+      "license": "NASA FIRMS provider terms apply; redistribution terms require review",
+      "attribution": "Credit NASA FIRMS and link to the original upstream API or dataset.",
+      "status": "excluded"
     },
     {
       "host": "focustaiwan.tw",
@@ -4400,9 +4418,6 @@
       "references": [
         {
           "path": "scripts/seed-cyber-threats.mjs"
-        },
-        {
-          "path": "server/worldmonitor/cyber/v1/_shared.ts"
         }
       ]
     },
@@ -4572,6 +4587,9 @@
       "references": [
         {
           "path": "api/download.js"
+        },
+        {
+          "path": "scripts/build-crawlable-corpus.mjs"
         },
         {
           "path": "scripts/generate-airline-codes.mjs"
@@ -5175,9 +5193,6 @@
       "references": [
         {
           "path": "scripts/seed-cyber-threats.mjs"
-        },
-        {
-          "path": "server/worldmonitor/cyber/v1/_shared.ts"
         }
       ]
     },
@@ -6385,6 +6400,9 @@
           "path": "scripts/validate-rss-feeds.mjs"
         },
         {
+          "path": "server/worldmonitor/intelligence/v1/_country-coverage-feeds.ts"
+        },
+        {
           "path": "server/worldmonitor/market/v1/stock-news-search.ts"
         },
         {
@@ -6925,9 +6943,6 @@
       "references": [
         {
           "path": "scripts/seed-cyber-threats.mjs"
-        },
-        {
-          "path": "server/worldmonitor/cyber/v1/_shared.ts"
         }
       ]
     },
@@ -7470,9 +7485,6 @@
           "path": "scripts/seed-market-quotes.mjs"
         },
         {
-          "path": "server/worldmonitor/market/v1/_shared.ts"
-        },
-        {
           "path": "server/worldmonitor/market/v1/analyze-stock.ts"
         },
         {
@@ -7576,9 +7588,6 @@
         },
         {
           "path": "scripts/seed-disease-outbreaks.mjs"
-        },
-        {
-          "path": "server/worldmonitor/cyber/v1/_shared.ts"
         }
       ]
     },
@@ -7989,6 +7998,20 @@
       ]
     },
     {
+      "host": "scanner.tradingview.com",
+      "provider": "TradingView",
+      "kind": "structured",
+      "observed": true,
+      "license": "TradingView terms; the screener scan endpoint is undocumented and redistribution requires review",
+      "attribution": "TradingView; link to the S&P 500 stock screener.",
+      "status": "terms-review",
+      "references": [
+        {
+          "path": "scripts/_sp500-breadth.mjs"
+        }
+      ]
+    },
+    {
       "host": "schema.org",
       "provider": "schema.org",
       "kind": "structured",
@@ -8005,6 +8028,9 @@
         },
         {
           "path": "scripts/build-use-cases.mjs"
+        },
+        {
+          "path": "scripts/crawlable-sources-page.mjs"
         }
       ]
     },
@@ -9759,9 +9785,20 @@
         },
         {
           "path": "scripts/seed-cyber-threats.mjs"
-        },
+        }
+      ]
+    },
+    {
+      "host": "us.sentry.io",
+      "provider": "Sentry error tracking",
+      "kind": "structured",
+      "observed": true,
+      "license": "Excluded: World Monitor operational telemetry, not an external data provider",
+      "attribution": "Excluded from the provider count: internal error-tracking request.",
+      "status": "excluded",
+      "references": [
         {
-          "path": "server/worldmonitor/cyber/v1/_shared.ts"
+          "path": "scripts/audit-sentry-resolve-pins.mjs"
         }
       ]
     },
@@ -10118,9 +10155,6 @@
           "path": "api/mcp/skill-extension/generated.ts"
         },
         {
-          "path": "api/not-found.ts"
-        },
-        {
           "path": "api/oauth/authorize.js"
         },
         {
@@ -10157,9 +10191,6 @@
           "path": "scripts/cross-strait-activity/adapters.mjs"
         },
         {
-          "path": "scripts/generate-sandbox-fixtures.mjs"
-        },
-        {
           "path": "scripts/lib/brief-embedding.mjs"
         },
         {
@@ -10169,7 +10200,7 @@
           "path": "scripts/lib/x-news-accounts.cjs"
         },
         {
-          "path": "scripts/mcp-live-smoke.mjs"
+          "path": "scripts/mcp-proxy-live-smoke.mjs"
         },
         {
           "path": "scripts/measure-mobile-mainthread.mjs"
@@ -10221,9 +10252,6 @@
         },
         {
           "path": "server/worldmonitor/infrastructure/v1/reverse-geocode.ts"
-        },
-        {
-          "path": "src/app/panel-layout.ts"
         },
         {
           "path": "src/bootstrap/web-vitals-utils.ts"
@@ -10530,9 +10558,6 @@
         },
         {
           "path": "server/worldmonitor/market/v1/_quote-provider.ts"
-        },
-        {
-          "path": "server/worldmonitor/market/v1/_shared.ts"
         }
       ]
     },
@@ -10714,9 +10739,6 @@
       "references": [
         {
           "path": "scripts/seed-fear-greed.mjs"
-        },
-        {
-          "path": "scripts/seed-market-breadth.mjs"
         }
       ]
     },
@@ -13578,6 +13600,9 @@
       "status": "terms-review",
       "references": [
         {
+          "path": "scripts/china-corporate-disclosures/adapters.mjs"
+        },
+        {
           "path": "scripts/china-stock-connect/adapters.mjs"
         }
       ]
@@ -14253,6 +14278,12 @@
           "path": "api/not-found.ts"
         },
         {
+          "path": "scripts/build-agent-skills-index.mjs"
+        },
+        {
+          "path": "scripts/build-ai-search.mjs"
+        },
+        {
           "path": "scripts/build-crawlable-corpus.mjs"
         },
         {
@@ -14283,7 +14314,10 @@
           "path": "scripts/generate-sandbox-fixtures.mjs"
         },
         {
-          "path": "scripts/mcp-live-smoke.mjs"
+          "path": "scripts/github-stars-snapshot.mjs"
+        },
+        {
+          "path": "scripts/mcp-proxy-live-smoke.mjs"
         },
         {
           "path": "scripts/measure-composited-layers.mjs"
@@ -14298,10 +14332,16 @@
           "path": "scripts/seo-indexnow-submit.mjs"
         },
         {
+          "path": "scripts/verify-agent-readiness.mjs"
+        },
+        {
           "path": "scripts/verify-sitemaps.mjs"
         },
         {
           "path": "server/_shared/deprecation-policy.ts"
+        },
+        {
+          "path": "src/app/panel-layout.ts"
         },
         {
           "path": "src/components/RuntimeConfigPanel.ts"

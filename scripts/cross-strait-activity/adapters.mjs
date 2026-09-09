@@ -1446,7 +1446,7 @@ function extractMndPublicationDay(html) {
     ?? extractHtmlElementBodies(html, ['div', 'section'], 'newsinfo')[0];
   if (container == null) throw new Error('MND_PUBLICATION_METADATA_MISSING');
   const dateBodies = extractHtmlElementBodies(container, ['span'], 'body-2', 2);
-  const publicationDay = dateBodies[0]?.includes('<') ? null : dottedDate(dateBodies[0]);
+  const publicationDay = dottedDate(decodeHtml(dateBodies[0]));
   if (!publicationDay || dateBodies.length !== 1) throw new Error('MND_PUBLICATION_DATE_MISSING');
   return publicationDay;
 }
@@ -1681,18 +1681,44 @@ function boundedHtmlRequestInit(sourceContract) {
   };
 }
 
-async function fetchBoundedTextWithStatus(fetchFn, url, sourceContract) {
+async function fetchBoundedTextWithStatus(fetchFn, url, sourceContract, diagnostic = null) {
   if (!isAllowedSourceUrl(url, sourceContract)) {
     throw new Error('UNSAFE_SOURCE_URL');
   }
   const response = await fetchFn(url, boundedHtmlRequestInit(sourceContract));
+  if (diagnostic) {
+    diagnostic.httpStatus = response.status;
+    diagnostic.stage = response.ok ? 'response_body' : 'response_headers';
+  }
   const text = await readBoundedTextResponse(response, sourceContract.maxResponseBytes);
+  if (diagnostic) diagnostic.stage = 'parse';
   return { text, status: response.status };
 }
 
-async function fetchBoundedText(fetchFn, url, sourceContract) {
-  const { text } = await fetchBoundedTextWithStatus(fetchFn, url, sourceContract);
+async function fetchBoundedText(fetchFn, url, sourceContract, diagnostic = null) {
+  const { text } = await fetchBoundedTextWithStatus(fetchFn, url, sourceContract, diagnostic);
   return text;
+}
+
+async function fetchMndViaProxy(input, init, proxyConfig, proxyRequestFn) {
+  const maxResponseBytes = CROSS_STRAIT_SOURCE_CONTRACTS.taiwanMnd.maxResponseBytes;
+  const result = await proxyRequestFn(String(input), proxyConfig, {
+    headers: init.headers,
+    maxResponseBytes,
+    timeoutMs: REQUEST_TIMEOUT_MS,
+    signal: init.signal,
+  });
+  if (!Number.isInteger(result?.status) || result.status < 200 || result.status > 599) {
+    throw new Error('MND_PROXY_RESPONSE_INVALID');
+  }
+  if (result.status >= 300) {
+    return new Response(null, { status: result.status });
+  }
+  if (!Buffer.isBuffer(result.buffer)) throw new Error('MND_PROXY_RESPONSE_INVALID');
+  if (result.buffer.byteLength > maxResponseBytes) throw new Error('RESPONSE_TOO_LARGE');
+  return new Response(result.status === 204 || result.status === 205 ? null : result.buffer, {
+    status: result.status,
+  });
 }
 
 function shouldProxyJapanModFailure(error) {
@@ -2104,6 +2130,8 @@ export function buildCrossStraitActivitySnapshot({
       transportStatus: mndOutcome?.ok ? 'fresh' : 'error',
       requestCount: mndOutcome?.requestCount ?? 0,
       errorCodes: mndOutcome?.errorCodes ?? [],
+      refreshErrorCodes: mndOutcome?.refreshErrorCodes ?? [],
+      requestDiagnostics: mndOutcome?.requestDiagnostics ?? [],
       // WHEN this verdict was produced. lastSuccessAt is retained across failing
       // runs by design, so on its own an errored record cannot say whether the
       // seeder just ran or stopped running days ago — see the japan-mod note.
@@ -2297,7 +2325,7 @@ async function probeJapanProxyControlTunnel(host, {
   tunnel?.destroy?.();
 }
 
-function rotatingRefreshCandidates(previousMnd, excludedUrls, now) {
+function rotatingRefreshCandidates(previousMnd, excludedUrls, now, limit) {
   const eligible = [...new Map(
     previousMnd
       .filter((row) => (
@@ -2316,13 +2344,20 @@ function rotatingRefreshCandidates(previousMnd, excludedUrls, now) {
   ).values()];
   if (eligible.length === 0) return [];
   const offset = (Math.floor(now / MND_REFRESH_ROTATION_INTERVAL_MS)
-    * MND_REFRESH_DETAIL_REQUESTS_PER_RUN) % eligible.length;
-  return Array.from({ length: Math.min(MND_REFRESH_DETAIL_REQUESTS_PER_RUN, eligible.length) },
+    * limit) % eligible.length;
+  return Array.from({ length: Math.min(limit, eligible.length) },
     (_, index) => eligible[(offset + index) % eligible.length]);
 }
 
-function hasMndOutboundBudget({ runStartedAt, nowFn, cadenceMs }) {
-  return nowFn() - runStartedAt + cadenceMs + REQUEST_TIMEOUT_MS <= MND_OUTBOUND_BUDGET_MS;
+function hasMndOutboundBudget({
+  runStartedAt,
+  nowFn,
+  cadenceMs,
+  reservedRequestCount = 0,
+}) {
+  const reservedMs = reservedRequestCount * (REQUEST_CADENCE_MS + REQUEST_TIMEOUT_MS);
+  return nowFn() - runStartedAt + cadenceMs + REQUEST_TIMEOUT_MS + reservedMs
+    <= MND_OUTBOUND_BUDGET_MS;
 }
 
 /**
@@ -2553,14 +2588,22 @@ export async function fetchCrossStraitActivitySnapshot({
   mndListUrl = CROSS_STRAIT_SOURCE_CONTRACTS.taiwanMnd.listUrl,
   sleepFn = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
   proxyUrl = process.env.JAPAN_MOD_PROXY_URL || process.env.PROXY_URL || '',
+  mndProxyUrl = process.env.PROXY_URL || '',
   proxyRequestFn = proxyFetch,
   proxyConnectFn = proxyConnectTunnel,
   proxyConnectProbeFn = null,
 } = {}) {
   const generatedAt = new Date(now).toISOString();
   const previousMnd = (previousSnapshot?.observations ?? [])
-    .filter((row) => row?.sourceId === 'taiwan-mnd');
+    .filter((row) => safePreviousMndObservation(row)
+      && validMndObservation(row)
+      && MND_CATEGORY_KEYS.every((key) => Object.hasOwn(row.categories, key))
+      && typeof row.publicationTime === 'string'
+      && Number.isFinite(Date.parse(row.publicationTime)));
   const previousMndByUrl = new Map(previousMnd.map((row) => [row.sourceUrl, row]));
+  const hasRetainedCoverage = (row) => (
+    previousMndByUrl.get(row.sourceUrl)?.publicationTime.slice(0, 10) === row.publicationDay
+  );
   const needsBackfill = new Set(previousMnd.map((row) => row.reportingDay)).size
     < MND_REQUIRED_REPORTING_DAYS;
   const listPages = needsBackfill ? MND_MAX_LIST_PAGES_PER_BACKFILL_RUN : 1;
@@ -2568,7 +2611,18 @@ export async function fetchCrossStraitActivitySnapshot({
   const latestCandidates = new Map();
   const unseenBackfillCandidates = new Map();
   const mndErrors = [];
+  const mndRefreshErrors = [];
+  const mndRequestDiagnostics = [];
   const mndContract = CROSS_STRAIT_SOURCE_CONTRACTS.taiwanMnd;
+  const mndProxyConfig = parseProxyConfig(mndProxyUrl);
+  const mndProxyFetchFn = mndProxyConfig
+    && Number.isInteger(mndProxyConfig.port) && mndProxyConfig.port > 0 && mndProxyConfig.port <= 65535
+    ? (input, init) => fetchMndViaProxy(input, init, mndProxyConfig, proxyRequestFn)
+    : null;
+  let mndPreferredFetchFn = fetchFn;
+  const mndTimeoutRetryFetchFn = () => mndProxyFetchFn && mndPreferredFetchFn === fetchFn
+    ? mndProxyFetchFn
+    : fetchFn;
   const resolvedJapanProxyFetchFn = proxyUrl
     ? (input, init) => fetchJapanModViaConfiguredProxy(input, init, {
         proxyUrl,
@@ -2594,9 +2648,10 @@ export async function fetchCrossStraitActivitySnapshot({
   });
   let discoveredCount = 0;
   let requestCount = 0;
+  let listRequestCount = 0;
   const runStartedAt = nowFn();
 
-  for (let page = 1; page <= listPages; page += 1) {
+  for (let page = 1; page <= listPages && listRequestCount < MND_MAX_LIST_PAGES_PER_BACKFILL_RUN; page += 1) {
     const url = page === 1 ? mndListUrl : `${mndListUrl}/${page}`;
     const cadenceMs = requestCount > 0 ? REQUEST_CADENCE_MS : 0;
     if (!hasMndOutboundBudget({ runStartedAt, nowFn, cadenceMs })) {
@@ -2608,10 +2663,47 @@ export async function fetchCrossStraitActivitySnapshot({
       break;
     }
     try {
-      if (cadenceMs) await sleepFn(cadenceMs);
-      const html = await fetchBoundedText(fetchFn, url, mndContract);
-      requestCount += 1;
-      const rows = parseTaiwanMndList(html).map((row) => {
+      let rows;
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        if (requestCount > 0) await sleepFn(REQUEST_CADENCE_MS);
+        requestCount += 1;
+        listRequestCount += 1;
+        const startedAt = monotonicNow();
+        const diagnostic = {
+          path: new URL(url).pathname, purpose: 'list', attempt: attempt + 1,
+          stage: 'response_headers', httpStatus: null,
+        };
+        const requestFetchFn = attempt > 0 ? mndTimeoutRetryFetchFn() : mndPreferredFetchFn;
+        if (requestFetchFn === mndProxyFetchFn) diagnostic.transport = 'proxy';
+        try {
+          const html = await fetchBoundedText(requestFetchFn, url, mndContract, diagnostic);
+          rows = parseTaiwanMndList(html);
+          if (rows.length === 0) {
+            mndErrors.push('MND_LIST_ROWS_MISSING');
+            mndRequestDiagnostics.push({
+              ...diagnostic, errorCode: 'MND_LIST_ROWS_MISSING', elapsedMs: Math.round(monotonicNow() - startedAt),
+            });
+          } else {
+            mndPreferredFetchFn = requestFetchFn;
+            if (attempt > 0 && mndProxyFetchFn) {
+              mndRequestDiagnostics.at(-1).recoveredVia = requestFetchFn === mndProxyFetchFn
+                ? 'proxy'
+                : 'direct';
+            }
+          }
+          break;
+        } catch (error) {
+          mndRequestDiagnostics.push({
+            ...diagnostic, errorCode: errorCode(error), elapsedMs: Math.round(monotonicNow() - startedAt),
+          });
+          if (errorCode(error) !== 'TIMEOUT' || attempt === 1
+            || listRequestCount >= MND_MAX_LIST_PAGES_PER_BACKFILL_RUN
+            || !hasMndOutboundBudget({ runStartedAt, nowFn, cadenceMs: REQUEST_CADENCE_MS })) {
+            throw error;
+          }
+        }
+      }
+      rows = rows.map((row) => {
         const previous = previousMndByUrl.get(row.sourceUrl);
         return {
           ...row,
@@ -2619,7 +2711,6 @@ export async function fetchCrossStraitActivitySnapshot({
           ...(previous ? { expectedReportingDay: previous.reportingDay } : {}),
         };
       });
-      if (rows.length === 0) mndErrors.push('MND_LIST_ROWS_MISSING');
       discoveredCount += rows.length;
       for (const row of rows) {
         if (page === 1) {
@@ -2633,57 +2724,122 @@ export async function fetchCrossStraitActivitySnapshot({
         }
       }
       if (
-        latestCandidates.size + unseenBackfillCandidates.size
+        [...latestCandidates.values()].filter((row) => !hasRetainedCoverage(row)).length
+          + unseenBackfillCandidates.size
         >= MND_MAX_DETAIL_REQUESTS_PER_RUN
       ) {
         break;
       }
     } catch (error) {
-      requestCount += 1;
       mndErrors.push(errorCode(error));
       if (page === 1) break;
     }
   }
 
-  const primaryPool = [
-    ...latestCandidates.values(),
+  const unchangedCurrent = [...latestCandidates.values()].filter(hasRetainedCoverage);
+  const coveredCurrentUrls = new Set(unchangedCurrent.map((row) => row.sourceUrl));
+  const requiredCurrent = [...latestCandidates.values()]
+    .filter((row) => !coveredCurrentUrls.has(row.sourceUrl));
+  const unresolvedCurrentUrls = new Set(requiredCurrent.map((row) => row.sourceUrl));
+  const primaryCandidates = [
+    ...requiredCurrent,
     ...unseenBackfillCandidates.values(),
   ].slice(0, MND_MAX_DETAIL_REQUESTS_PER_RUN);
-  const refreshCandidates = rotatingRefreshCandidates(
+  const currentRefresh = unchangedCurrent.length === 0 ? [] : [{
+    ...unchangedCurrent[Math.floor(now / MND_REFRESH_ROTATION_INTERVAL_MS) % unchangedCurrent.length],
+    allowPublicationAdvance: true,
+  }];
+  const refreshCandidates = [...currentRefresh, ...rotatingRefreshCandidates(
     previousMnd,
-    new Set(primaryPool.map((row) => row.sourceUrl)),
+    new Set([...latestCandidates.keys(), ...unseenBackfillCandidates.keys()]),
     now,
-  );
-  const primaryCandidates = primaryPool.slice(
-    0,
-    MND_MAX_DETAIL_REQUESTS_PER_RUN - refreshCandidates.length,
-  );
-  const candidates = [...primaryCandidates, ...refreshCandidates]
-    .slice(0, MND_MAX_DETAIL_REQUESTS_PER_RUN);
+    MND_REFRESH_DETAIL_REQUESTS_PER_RUN - currentRefresh.length,
+  )];
+  const candidateSchedule = [
+    ...primaryCandidates.map((candidate) => ({
+      candidate,
+      isRefresh: false,
+      reservedRefreshAttempts: 0,
+    })),
+    ...refreshCandidates.map((candidate, index) => ({
+      candidate,
+      isRefresh: true,
+      reservedRefreshAttempts: refreshCandidates.length - index - 1,
+    })),
+  ];
   const parsedMnd = [];
-  for (const candidate of candidates) {
-    if (!hasMndOutboundBudget({
-      runStartedAt,
-      nowFn,
-      cadenceMs: REQUEST_CADENCE_MS,
-    })) {
-      mndErrors.push('OUTBOUND_BUDGET_EXHAUSTED');
-      break;
-    }
-    try {
-      await sleepFn(REQUEST_CADENCE_MS);
-      const html = await fetchBoundedText(fetchFn, candidate.sourceUrl, mndContract);
-      requestCount += 1;
-      parsedMnd.push(parseTaiwanMndDetail(html, {
-        sourceUrl: candidate.sourceUrl,
-        retrievedAt: generatedAt,
-        expectedPublicationDay: candidate.publicationDay,
-        allowPublicationAdvance: candidate.allowPublicationAdvance === true,
-        expectedReportingDay: candidate.expectedReportingDay ?? null,
-      }));
-    } catch (error) {
-      requestCount += 1;
-      mndErrors.push(errorCode(error));
+  let detailRequestCount = 0;
+  let primaryBudgetExhausted = false;
+  candidateLoop:
+  for (const { candidate, isRefresh, reservedRefreshAttempts } of candidateSchedule) {
+    const candidateErrors = isRefresh ? mndRefreshErrors : mndErrors;
+    if (primaryBudgetExhausted && !isRefresh) continue;
+    // Required rows consume capacity first; only optional retries reserve room
+    // for the remaining optional first attempts.
+    const detailAttemptLimit = MND_MAX_DETAIL_REQUESTS_PER_RUN
+      - (isRefresh ? Math.min(reservedRefreshAttempts,
+        Math.max(0, MND_MAX_DETAIL_REQUESTS_PER_RUN - detailRequestCount - 1)) : 0);
+    let retryErrorCode = null;
+    while (detailRequestCount < detailAttemptLimit) {
+      if (!hasMndOutboundBudget({
+        runStartedAt,
+        nowFn,
+        cadenceMs: REQUEST_CADENCE_MS,
+        reservedRequestCount: isRefresh && !retryErrorCode ? 0 : reservedRefreshAttempts,
+      })) {
+        if (retryErrorCode) candidateErrors.push(retryErrorCode);
+        candidateErrors.push('OUTBOUND_BUDGET_EXHAUSTED');
+        if (isRefresh && !retryErrorCode) break candidateLoop;
+        if (!isRefresh) primaryBudgetExhausted = true;
+        break;
+      }
+      const diagnostic = {
+        path: new URL(candidate.sourceUrl).pathname,
+        purpose: isRefresh ? 'refresh' : 'detail', attempt: retryErrorCode ? 2 : 1,
+        stage: 'response_headers', httpStatus: null,
+      };
+      const requestFetchFn = retryErrorCode === 'TIMEOUT'
+        ? mndTimeoutRetryFetchFn()
+        : mndPreferredFetchFn;
+      if (requestFetchFn === mndProxyFetchFn) diagnostic.transport = 'proxy';
+      let startedAt;
+      try {
+        await sleepFn(REQUEST_CADENCE_MS);
+        detailRequestCount += 1;
+        requestCount += 1;
+        startedAt = monotonicNow();
+        const html = await fetchBoundedText(requestFetchFn, candidate.sourceUrl, mndContract, diagnostic);
+        parsedMnd.push(parseTaiwanMndDetail(html, {
+          sourceUrl: candidate.sourceUrl,
+          retrievedAt: generatedAt,
+          expectedPublicationDay: candidate.publicationDay,
+          allowPublicationAdvance: candidate.allowPublicationAdvance === true,
+          expectedReportingDay: candidate.expectedReportingDay ?? null,
+        }));
+        unresolvedCurrentUrls.delete(candidate.sourceUrl);
+        mndPreferredFetchFn = requestFetchFn;
+        if (retryErrorCode && mndProxyFetchFn) {
+          mndRequestDiagnostics.at(-1).recoveredVia = requestFetchFn === mndProxyFetchFn
+            ? 'proxy'
+            : 'direct';
+        }
+        break;
+      } catch (error) {
+        const code = errorCode(error);
+        if (startedAt !== undefined) mndRequestDiagnostics.push({
+          ...diagnostic, errorCode: code, elapsedMs: Math.round(monotonicNow() - startedAt),
+        });
+        if (
+          (code === 'MND_PUBLICATION_METADATA_MISSING' || code === 'TIMEOUT')
+          && !retryErrorCode
+          && detailRequestCount < detailAttemptLimit
+        ) {
+          retryErrorCode = code;
+          continue;
+        }
+        candidateErrors.push(code);
+        break;
+      }
     }
   }
 
@@ -2691,13 +2847,18 @@ export async function fetchCrossStraitActivitySnapshot({
   const hasHardMndError = mndErrors.some(
     (code) => code !== 'OUTBOUND_BUDGET_EXHAUSTED',
   );
+  if (unresolvedCurrentUrls.size > 0 && !hasHardMndError) {
+    mndErrors.push('MND_CURRENT_LIST_INCOMPLETE');
+  }
   const mndOutcome = {
     ok: discoveredCount > 0
       && !hasHardMndError
-      && (candidates.length === 0 || parsedMnd.length > 0),
+      && unresolvedCurrentUrls.size === 0,
     requestCount,
     observations: parsedMnd,
     errorCodes: [...new Set(mndErrors)],
+    refreshErrorCodes: [...new Set(mndRefreshErrors)],
+    requestDiagnostics: mndRequestDiagnostics,
   };
   return buildCrossStraitActivitySnapshot({
     generatedAt,
@@ -2706,6 +2867,24 @@ export async function fetchCrossStraitActivitySnapshot({
     mndOutcome,
     japanOutcome,
   });
+}
+
+function validMndObservation(row) {
+  return /^\d{4}-\d{2}-\d{2}$/.test(row.reportingDay)
+    && Number.isFinite(Date.parse(row.reportingPeriod?.start))
+    && Number.isFinite(Date.parse(row.reportingPeriod?.end))
+    && Date.parse(row.reportingPeriod.end) > Date.parse(row.reportingPeriod.start)
+    && isAllowedSourceUrl(row.sourceUrl, CROSS_STRAIT_SOURCE_CONTRACTS.taiwanMnd)
+    && Object.values(row.categories ?? {}).length === MND_CATEGORY_KEYS.length
+    && Object.values(row.categories).every(
+      (value) => value == null || (Number.isInteger(value) && value >= 0),
+    )
+    && Array.isArray(row.history)
+    && row.history.length <= MND_MAX_REVISION_VINTAGES_PER_DAY
+    && Number.isInteger(row.revision?.sequence)
+    && row.revision.sequence >= 1
+    && row.provenance?.contractVersion === 'decision-signal-provenance/v1'
+    && row.provenance?.familyId === 'operational_activity_record';
 }
 
 export function validateCrossStraitActivitySnapshot(snapshot) {
@@ -2725,21 +2904,5 @@ export function validateCrossStraitActivitySnapshot(snapshot) {
   ) return false;
   const mnd = snapshot.observations.filter((row) => row?.sourceId === 'taiwan-mnd');
   if (mnd.length === 0) return false;
-  return mnd.every((row) => (
-    /^\d{4}-\d{2}-\d{2}$/.test(row.reportingDay)
-    && Number.isFinite(Date.parse(row.reportingPeriod?.start))
-    && Number.isFinite(Date.parse(row.reportingPeriod?.end))
-    && Date.parse(row.reportingPeriod.end) > Date.parse(row.reportingPeriod.start)
-    && isAllowedSourceUrl(row.sourceUrl, CROSS_STRAIT_SOURCE_CONTRACTS.taiwanMnd)
-    && Object.values(row.categories ?? {}).length === MND_CATEGORY_KEYS.length
-    && Object.values(row.categories).every(
-      (value) => value == null || (Number.isInteger(value) && value >= 0),
-    )
-    && Array.isArray(row.history)
-    && row.history.length <= MND_MAX_REVISION_VINTAGES_PER_DAY
-    && Number.isInteger(row.revision?.sequence)
-    && row.revision.sequence >= 1
-    && row.provenance?.contractVersion === 'decision-signal-provenance/v1'
-    && row.provenance?.familyId === 'operational_activity_record'
-  ));
+  return mnd.every(validMndObservation);
 }

@@ -8,7 +8,7 @@
 
 import { isIosLikeUserAgent } from './platform-ua';
 import { SENTRY_ALLOW_URLS } from './sentry-allow-urls';
-import { getSentryBuildMetadata } from './sentry-build-metadata';
+import { getSentryBuildMetadata, isolateNonProductionSentryEvent } from '../../shared/sentry-build-metadata';
 
 type SentryNs = typeof import('@sentry/browser');
 
@@ -58,14 +58,16 @@ const THIRD_PARTY_FETCH_HOST_ALLOWLIST = new Set([
 
 function buildSentryInitOptions(): Parameters<SentryNs['init']>[0] {
   const sentryDsn = import.meta.env.VITE_SENTRY_DSN?.trim();
+  const environment = (location.hostname === 'worldmonitor.app' || location.hostname.endsWith('.worldmonitor.app')) ? 'production'
+    : location.hostname.includes('vercel.app') ? 'preview'
+    : 'development';
   return {
     dsn: sentryDsn || undefined,
-    ...getSentryBuildMetadata(__APP_VERSION__, __BUILD_HASH__),
-    environment: (location.hostname === 'worldmonitor.app' || location.hostname.endsWith('.worldmonitor.app')) ? 'production'
-      : location.hostname.includes('vercel.app') ? 'preview'
-      : 'development',
+    ...getSentryBuildMetadata(__APP_VERSION__, __BUILD_HASH__, environment),
+    environment,
     enabled: Boolean(sentryDsn) && !location.hostname.startsWith('localhost') && !('__TAURI_INTERNALS__' in window),
     allowUrls: SENTRY_ALLOW_URLS,
+    maxValueLength: 2048,
     sendDefaultPii: true,
     tracesSampleRate: 0.1,
     ignoreErrors: [
@@ -437,7 +439,7 @@ function buildSentryInitOptions(): Parameters<SentryNs['init']>[0] {
       const vendorChunk = /\/(maplibre|deck-stack|d3|topojson|i18n|sentry|transformers|onnxruntime)-[A-Za-z0-9_-]+\.js/;
       const firstPartyFile = (filename: string) => {
         if (/\.(ts|tsx)$/.test(filename) || /^src\//.test(filename)) return true;
-        if (/\/assets\/[A-Za-z0-9_-]+(-[A-Za-z0-9_-]+)*\.js/.test(filename)) return !vendorChunk.test(filename);
+        if (/\/assets\/[A-Za-z0-9_-]+\.js/.test(filename)) return !vendorChunk.test(filename);
         return false;
       };
       const nonInfraFrames = frames.filter(f => f.filename && f.filename !== '<anonymous>' && f.filename !== '[native code]' && !/\/sentry-[A-Za-z0-9_-]+\.js/.test(f.filename));
@@ -884,7 +886,9 @@ function buildSentryInitOptions(): Parameters<SentryNs['init']>[0] {
       if (
         !hasFirstParty
         && (
-          /signal timed out/.test(msg)
+          // Explicit panel reports identify an app failure even when the
+          // browser-created timeout has no first-party stack frames.
+          (/signal timed out/.test(msg) && event.tags?.kind !== 'panel_call_rejected')
           || /NotSupportedError/.test(msg)
           || /out of memory/i.test(msg)
           || /\.(?:toLowerCase|trim|indexOf|findIndex) is not a function/.test(msg)
@@ -1094,6 +1098,7 @@ function buildSentryInitOptions(): Parameters<SentryNs['init']>[0] {
       if (excType === 'SyntaxError'
           && /^(?:SyntaxError: )?(?:Invalid or unexpected token|Unexpected (?:token|keyword|identifier|EOF|end of script))/.test(msg)
           && frames.some(f => /\/(?:maplibre|deck-stack)-[A-Za-z0-9_-]+\.js/.test(f.filename ?? ''))) return null;
+      isolateNonProductionSentryEvent(event, environment);
       return event;
     },
   };

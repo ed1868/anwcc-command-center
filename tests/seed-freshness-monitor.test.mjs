@@ -1,5 +1,9 @@
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import { describe, it } from 'node:test';
 
 import YAML from 'yaml';
@@ -10,9 +14,14 @@ import {
   buildAcceptanceObservation,
   findOperationalProblems,
   formatAcceptanceReport,
+  formatAcceptanceMarkdown,
+  isChinaCoveragePendingProblem,
   isOnDemandProblem,
-  findGracedStaleContent,
+  findPendingDiagnostics,
+  isSourceFailurePendingProblem,
   isStaleContentGraceProblem,
+  CHINA_COVERAGE_PENDING_SKEW_SLACK_MS,
+  MAX_CHINA_COVERAGE_PENDING_MS,
   MAX_STALE_CONTENT_GRACE_MS,
   STALE_CONTENT_GRACE_SKEW_SLACK_MS,
   validateAcceptanceBaseline,
@@ -32,6 +41,128 @@ const TEST_WORKFLOW_URL = new URL('../.github/workflows/test.yml', import.meta.u
 const PRE_PUSH_HOOK_URL = new URL('../.husky/pre-push', import.meta.url);
 const readCommittedBaseline = () => JSON.parse(readFileSync(COMMITTED_BASELINE_URL, 'utf8'));
 const readRailwayServices = () => JSON.parse(readFileSync(RAILWAY_SERVICES_URL, 'utf8'));
+
+describe('production acceptance summary', () => {
+  const now = Date.parse('2026-09-05T07:00:00.000Z');
+  const baseline = { expiresAt: '2026-09-06', acknowledged: [] };
+
+  it('keeps bounded source failures visible while pending and alerts at the deadline', () => {
+    const problem = {
+      status: 'SEED_ERROR', records: 133, seedAgeMin: 1, maxStaleMin: 720,
+      errorCode: 'MND_SOURCE_ERROR', lastSourceFailureCode: 'MND_SOURCE_ERROR',
+      consecutiveSourceFailures: 1,
+      sourceFailurePendingUntil: new Date(now + 210 * 60_000).toISOString(),
+    };
+    const payload = { status: 'HEALTHY', pending: { crossStraitActivityTaiwanMnd: problem } };
+    assert.deepEqual(findOperationalProblems(payload, now), []);
+    assert.deepEqual(findPendingDiagnostics(payload, now), [{ name: 'crossStraitActivityTaiwanMnd', status: 'SEED_ERROR', graceUntil: problem.sourceFailurePendingUntil }]);
+    for (const over of [
+      { sourceFailurePendingUntil: new Date(now).toISOString() },
+      { sourceFailurePendingUntil: null }, { sourceFailurePendingUntil: 'bad' },
+      { sourceFailurePendingUntil: [problem.sourceFailurePendingUntil] },
+      { sourceFailurePendingUntil: new Date(now + 216 * 60_000).toISOString() },
+      { consecutiveSourceFailures: 2 }, { records: 0 }, { seedAgeMin: 721 },
+      { seedAgeMin: -1 }, { lastSourceFailureCode: 'MND_OTHER' }, { status: 'EMPTY' },
+    ]) {
+      const invalid = { status: 'HEALTHY', pending: { crossStraitActivityTaiwanMnd: { ...problem, ...over } } };
+      assert.equal(findOperationalProblems(invalid, now).length, 1, JSON.stringify(over));
+    }
+  });
+
+  it('softens only recognized bounded NHC recovery metadata', () => {
+    const problem = {
+      status: 'SEED_ERROR', records: 2, seedAgeMin: 1, maxStaleMin: 540,
+      errorCode: 'NHC_POINT_REQUEST_FAILED', lastSourceFailureCode: 'NHC_POINT_REQUEST_FAILED',
+      consecutiveSourceFailures: 1,
+      sourceFailurePendingUntil: new Date(now + 210 * 60_000).toISOString(),
+    };
+    assert.equal(isSourceFailurePendingProblem(problem, now), true);
+    for (const over of [
+      { errorCode: 'NHC_OTHER', lastSourceFailureCode: 'NHC_OTHER' },
+      { sourceFailurePendingUntil: new Date(now + 216 * 60_000).toISOString() },
+      { consecutiveSourceFailures: 2 },
+      { records: 0 },
+      { seedAgeMin: 541 },
+    ]) {
+      assert.equal(isSourceFailurePendingProblem({ ...problem, ...over }, now), false, JSON.stringify(over));
+    }
+  });
+  const observation = (problems, accepted = baseline) => buildAcceptanceObservation({
+    status: Object.keys(problems).length ? 'WARNING' : 'HEALTHY',
+    checkedAt: new Date(now).toISOString(),
+    problems,
+  }, accepted, now);
+
+  it('shows every continuing incident independently of the workflow verdict', () => {
+    const report = observation({
+      wildfires: { status: 'SEED_ERROR', records: 1932, errorCode: 'FIRMS_PARTIAL_COVERAGE' },
+      physicalDivergence: { status: 'SEED_ERROR', records: 2 },
+      crossStraitActivityTaiwanMnd: { status: 'SEED_ERROR', records: 133 },
+    });
+    const markdown = formatAcceptanceMarkdown(report);
+    assert.match(markdown, /\*\*Failed\.\*\* Observed 2026-09-05T07:00:00.000Z/);
+    for (const source of report.acceptance.blocking) assert.ok(markdown.includes(`| ${source.name} | Active |`));
+    assert.ok(markdown.includes('FIRMS\\_PARTIAL\\_COVERAGE'));
+    assert.match(markdown, /without a new incident alert/);
+  });
+
+  it('keeps acknowledgements, grace deadlines, and cleared baseline entries distinct', () => {
+    const report = observation({
+      known: { status: 'EMPTY' },
+      frozen: { status: 'STALE_CONTENT', staleContentGraceUntil: '2026-09-05T08:00:00.000Z' },
+    }, { ...baseline, acknowledged: [
+      { name: 'known', status: 'EMPTY', issue: 1, reason: 'Known source problem' },
+      { name: 'recovered', status: 'EMPTY', issue: 2, reason: 'Old problem' },
+    ] });
+    const markdown = formatAcceptanceMarkdown(report);
+    assert.match(markdown, /Passed with acknowledged degradation or active grace/);
+    assert.match(markdown, /known \| Acknowledged/);
+    assert.match(markdown, /frozen \| In grace \| Alerts at 2026-09-05T08:00:00.000Z/);
+    assert.match(markdown, /recovered \| Baseline entry cleared/);
+  });
+
+  it('escapes source text and keeps an expired baseline failed even with no incidents', () => {
+    const hostile = formatAcceptanceMarkdown(observation({
+      '<img>\n[link](https://example.com)|extra': { status: 'UNKNOWN', errorCode: '<secret>' },
+    }));
+    assert.doesNotMatch(hostile, /<img>|<secret>|\[link\]\(/);
+    assert.match(hostile, /&lt;img&gt;/);
+    assert.match(hostile, /&#124;/);
+    assert.match(formatAcceptanceMarkdown(observation({})), /\*\*Passed\.\*\*/);
+    const expired = formatAcceptanceMarkdown(observation({}, {
+      expiresAt: '2026-09-04',
+      acknowledged: [{ name: 'old', status: 'EMPTY', issue: 1, reason: 'Old baseline' }],
+    }));
+    assert.match(expired, /\*\*Failed\.\*\*/);
+    assert.match(expired, /baseline expired/);
+  });
+
+  it('writes JSON and Markdown from one CLI request before returning a failed verdict', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'seed-summary-'));
+    try {
+      const preload = join(dir, 'fetch.mjs');
+      const calls = join(dir, 'calls');
+      writeFileSync(preload, `import { appendFileSync } from 'node:fs';
+globalThis.fetch = async () => {
+  appendFileSync(${JSON.stringify(calls)}, 'request\\n');
+  return Response.json({ status: 'WARNING', checkedAt: new Date().toISOString(), problems: { wildfires: { status: 'SEED_ERROR', records: 2 } } });
+};\n`);
+      const json = join(dir, 'observation.json');
+      const markdown = join(dir, 'summary.md');
+      const result = spawnSync(process.execPath, [
+        '--import', preload, fileURLToPath(new URL('../scripts/check-seed-freshness.mjs', import.meta.url)),
+        '--json-output', json, '--markdown-output', markdown,
+      ], { encoding: 'utf8', timeout: 10_000 });
+      assert.equal(result.status, 1, result.stderr);
+      const report = JSON.parse(readFileSync(json, 'utf8'));
+      assert.equal(report.report.failed, true);
+      assert.equal(readFileSync(markdown, 'utf8'), formatAcceptanceMarkdown(report));
+      assert.equal(readFileSync(calls, 'utf8'), 'request\n');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
 
 describe('scheduled seed freshness monitor', () => {
   it('projects stable per-source statuses without putting changing ages in the incident identity', () => {
@@ -194,15 +325,18 @@ describe('scheduled seed freshness monitor', () => {
     };
 
     assert.equal(isStaleContentGraceProblem(problem, now), true);
-    assert.deepEqual(findOperationalProblems({
-      status: 'HEALTHY',
-      problems: { temporalAnomalies: problem },
-    }, now), []);
+    for (const collection of ['problems', 'pending']) {
+      assert.deepEqual(findOperationalProblems({
+        status: 'HEALTHY',
+        [collection]: { temporalAnomalies: problem },
+      }, now), []);
+    }
 
     for (const [label, candidate] of [
       ['exact deadline', { ...problem, staleContentGraceUntil: new Date(now).toISOString() }],
       ['missing deadline', { status: 'STALE_CONTENT' }],
       ['malformed deadline', { ...problem, staleContentGraceUntil: 'not-a-date' }],
+      ['non-string deadline', { ...problem, staleContentGraceUntil: [problem.staleContentGraceUntil] }],
       ['excessive deadline', {
         ...problem,
         staleContentGraceUntil: new Date(now + MAX_STALE_CONTENT_GRACE_MS + 1).toISOString(),
@@ -214,9 +348,64 @@ describe('scheduled seed freshness monitor', () => {
       ['wrong status', { ...problem, status: 'STALE_SEED' }],
     ]) {
       assert.equal(isStaleContentGraceProblem(candidate, now), false, label);
+      for (const collection of ['problems', 'pending']) {
+        assert.equal(findOperationalProblems({
+          status: 'HEALTHY',
+          [collection]: { temporalAnomalies: candidate },
+        }, now).length, 1, `${collection}: ${label}`);
+      }
+    }
+  });
+
+  it('consumes only active bounded China coverage pending entries', () => {
+    const now = Date.parse('2026-09-08T16:01:00.000Z');
+    assert.equal(
+      MAX_CHINA_COVERAGE_PENDING_MS,
+      healthTesting.CHINA_DECISION_SIGNALS_PENDING_MS
+        + CHINA_COVERAGE_PENDING_SKEW_SLACK_MS,
+    );
+    const pendingUntil = new Date(
+      now + healthTesting.CHINA_DECISION_SIGNALS_PENDING_MS,
+    ).toISOString();
+    const problem = {
+      status: 'COVERAGE_PARTIAL',
+      chinaCoveragePendingUntil: pendingUntil,
+    };
+    const compact = healthTesting.healthResponseBody({
+      status: 'HEALTHY',
+      summary: { total: 1, ok: 1, warn: 0, pending: 1, crit: 0 },
+      checkedAt: new Date(now).toISOString(),
+      checks: { chinaDecisionSignals: problem },
+    }, true);
+
+    assert.equal(isChinaCoveragePendingProblem(problem, now), true);
+    assert.equal(
+      isChinaCoveragePendingProblem({ ...problem, status: 'CHINA_DEGRADED' }, now),
+      true,
+    );
+    assert.deepEqual(compact.pending, { chinaDecisionSignals: problem });
+    assert.deepEqual(findOperationalProblems(compact, now), []);
+    assert.deepEqual(findPendingDiagnostics(compact, now), [{
+      name: 'chinaDecisionSignals',
+      status: 'COVERAGE_PARTIAL',
+      graceUntil: pendingUntil,
+    }]);
+
+    for (const [label, candidate] of [
+      ['exact deadline', { ...problem, chinaCoveragePendingUntil: new Date(now).toISOString() }],
+      ['missing deadline', { status: 'COVERAGE_PARTIAL' }],
+      ['malformed deadline', { ...problem, chinaCoveragePendingUntil: 'not-a-date' }],
+      ['non-string deadline', { ...problem, chinaCoveragePendingUntil: [pendingUntil] }],
+      ['excessive deadline', {
+        ...problem,
+        chinaCoveragePendingUntil: new Date(now + MAX_CHINA_COVERAGE_PENDING_MS + 1).toISOString(),
+      }],
+      ['wrong status', { ...problem, status: 'SEED_ERROR' }],
+    ]) {
+      assert.equal(isChinaCoveragePendingProblem(candidate, now), false, label);
       assert.equal(findOperationalProblems({
-        status: 'WARNING',
-        problems: { temporalAnomalies: candidate },
+        status: 'HEALTHY',
+        pending: { chinaDecisionSignals: candidate },
       }, now).length, 1, label);
     }
   });
@@ -229,7 +418,7 @@ describe('scheduled seed freshness monitor', () => {
     const graceUntil = new Date(now + 60 * 60 * 1000).toISOString();
     const payload = {
       status: 'HEALTHY',
-      problems: {
+      pending: {
         temporalAnomalies: { status: 'STALE_CONTENT', staleContentGraceUntil: graceUntil },
         expired: {
           status: 'STALE_CONTENT',
@@ -238,7 +427,7 @@ describe('scheduled seed freshness monitor', () => {
       },
     };
 
-    assert.deepEqual(findGracedStaleContent(payload, now), [
+    assert.deepEqual(findPendingDiagnostics(payload, now), [
       { name: 'temporalAnomalies', status: 'STALE_CONTENT', graceUntil },
     ]);
     // The expired one is not "in grace" — it is a real operational problem.
@@ -246,6 +435,15 @@ describe('scheduled seed freshness monitor', () => {
       findOperationalProblems(payload, now).map((p) => p.name),
       ['expired'],
     );
+    const duplicateWarning = {
+      ...payload,
+      problems: { temporalAnomalies: { status: 'SEED_ERROR', records: 1 } },
+    };
+    assert.deepEqual(findPendingDiagnostics(duplicateWarning, now), [], 'pending cannot hide a duplicate warning');
+    assert.deepEqual(findOperationalProblems(duplicateWarning, now).map((p) => p.name), ['expired', 'temporalAnomalies']);
+    assert.deepEqual(findPendingDiagnostics({ ...payload, problems: payload.pending }, now), [
+      { name: 'temporalAnomalies', status: 'STALE_CONTENT', graceUntil },
+    ], 'legacy and new collections do not duplicate the same grace');
   });
 
   it('treats every non-on-demand health problem as an operational failure', () => {
@@ -414,6 +612,10 @@ describe('scheduled seed freshness monitor', () => {
       () => validateCompactHealthPayload({ status: 'HEALTHY', problems: [] }),
       /problems/,
     );
+    for (const pending of [[], null, false, 'pending', { source: null }, { source: [] }]) {
+      assert.throws(() => validateCompactHealthPayload({ status: 'HEALTHY', pending }), /pending/);
+      assert.throws(() => findPendingDiagnostics({ status: 'HEALTHY', pending }), /pending/);
+    }
   });
 
   describe('accepted-problem baseline', () => {
@@ -1097,7 +1299,7 @@ describe('scheduled seed freshness monitor', () => {
 
         assert.match(
           workflow,
-          /unit:[\s\S]*?fetch-depth: 0[\s\S]*?name: Enforce health-probe cutovers[\s\S]*?node --import tsx scripts\/check-health-probe-cutovers\.mts/,
+          /unit-shards:[\s\S]*?fetch-depth: 0[\s\S]*?name: Enforce health-probe cutovers[\s\S]*?node --import tsx scripts\/check-health-probe-cutovers\.mts/,
         );
         assert.match(
           hook,
@@ -1124,7 +1326,8 @@ describe('scheduled seed freshness monitor', () => {
       // The merge ref's FIRST parent is the base tip the tree was merged onto,
       // so it cannot drift away from what is actually being tested.
       it('bases the cutover diff on the merged tree, not the pinned base.sha', () => {
-        const workflow = readFileSync(TEST_WORKFLOW_URL, 'utf8');
+        const workflow = readFileSync(TEST_WORKFLOW_URL, 'utf8').split('  unit-shards:\n')[1]?.split('  unit:\n')[0];
+        assert.ok(workflow, 'the unit shard job must exist');
 
         // Matches the interpolation, not the prose: the step's own comment names
         // the rejected expression to explain why it is rejected.

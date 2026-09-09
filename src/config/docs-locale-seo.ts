@@ -13,6 +13,7 @@
  */
 
 import { ORGANIZATION_ID, WEBSITE_ID } from './schema-graph-ids';
+import { DOCS_PAGE_DATES } from './docs-page-dates.generated';
 
 export const DOCS_PUBLIC_ORIGIN = 'https://www.worldmonitor.app';
 export const DOCS_ZH_HREFLANG = 'zh-Hans';
@@ -124,26 +125,34 @@ function replaceOgLocale(html: string, locale: string): string {
   return html;
 }
 
-function stripExistingDocsHreflang(html: string): string {
-  return html.replace(
-    /\s*<link\b[^>]*\brel=["']alternate["'][^>]*\bhreflang=["'][^"']+["'][^>]*>/gi,
-    '',
+function rewriteDocsHeadLinks(html: string, pathname: string): string {
+  const href = docsAbsoluteUrl(pathname).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;');
+  const canonical = `<link rel="canonical" href="${href}" />`;
+  const alternates = buildDocsHreflangLinkTags(pathname).join('');
+  let inHead = false;
+  let replaced = false;
+  let inserted = false;
+  const rewritten = html.replace(
+    /<!--[\s\S]*?-->|<(script|style)\b[^>]*>[\s\S]*?<\/\1(?:[\t\n\f\r ][^>]*|\/[^>]*)?>|<(?:head|\/head|link)\b(?:[^>"']|"[^"]*"|'[^']*')*>/gi,
+    (tag) => {
+      if (/^<head[\t\n\f\r >]/i.test(tag)) inHead = true;
+      if (/^<\/head[\t\n\f\r >]/i.test(tag) && inHead) {
+        inHead = false;
+        inserted = true;
+        return `${replaced ? '' : canonical}${alternates}${tag}`;
+      }
+      if (!inHead || !/^<link\b/i.test(tag)) return tag;
+      const attributes = [...tag.matchAll(/\s+([^\s=/>]+)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/g)];
+      const rel = attributes.find((attribute) => attribute[1]?.toLowerCase() === 'rel');
+      const relations = (rel?.[2] ?? rel?.[3] ?? rel?.[4] ?? '').toLowerCase().split(/\s+/);
+      if (relations.includes('alternate') && attributes.some((attribute) => attribute[1]?.toLowerCase() === 'hreflang')) return '';
+      if (!relations.includes('canonical')) return tag;
+      if (replaced) return '';
+      replaced = true;
+      return canonical;
+    },
   );
-}
-
-function injectAfterCanonical(html: string, linkTags: string[]): string {
-  if (linkTags.length === 0) return html;
-  const block = linkTags.join('');
-  if (/<link\b[^>]*\brel=["']canonical["'][^>]*>/i.test(html)) {
-    return html.replace(
-      /(<link\b[^>]*\brel=["']canonical["'][^>]*>)/i,
-      `$1${block}`,
-    );
-  }
-  if (/<\/head>/i.test(html)) {
-    return html.replace(/<\/head>/i, `${block}</head>`);
-  }
-  return `${html}${block}`;
+  return inserted ? rewritten : `${rewritten}${alternates}`;
 }
 
 const CANONICAL_WEBSITE_ID = WEBSITE_ID;
@@ -154,7 +163,7 @@ const DOCS_WEBSITE_IDS = new Set([
   `${DOCS_PUBLIC_ORIGIN}/docs/#website`,
 ]);
 const JSON_LD_SCRIPT_RE =
-  /<script\b(?=[^>]*\btype=["']application\/ld\+json["'])[^>]*>([\s\S]*?)<\/script>/gi;
+  /<script\b(?=[^>]*\btype\s*=\s*["']application\/ld\+json["'])[^>]*>([\s\S]*?)<\/script(?:[\t\n\f\r ][^>]*|\/[^>]*)?>/gi;
 
 /** `@type` may be a string or an array of strings in valid JSON-LD. */
 function hasJsonLdType(node: Record<string, unknown>, type: string): boolean {
@@ -173,7 +182,13 @@ function isMintlifyAgent(value: unknown): boolean {
   const agent = value as Record<string, unknown>;
   const name = typeof agent.name === 'string' ? agent.name.toLowerCase() : '';
   const url = typeof agent.url === 'string' ? agent.url.toLowerCase() : '';
-  return name.includes('mintlify') || url.includes('mintlify.com');
+  if (name.includes('mintlify')) return true;
+  try {
+    const hostname = new URL(url).hostname;
+    return hostname === 'mintlify.com' || hostname.endsWith('.mintlify.com');
+  } catch {
+    return false;
+  }
 }
 
 function isWebSiteNode(node: unknown): node is Record<string, unknown> {
@@ -227,19 +242,23 @@ function collapseCanonicalWebSite(node: Record<string, unknown>): Record<string,
 }
 
 /**
- * Walk every node at every depth — a WebSite can sit at the top level, inside a
+ * Collapse canonical Organization bodies to references and prune WebSites at
+ * every depth. These nodes can sit at the top level, inside a
  * top-level array, under `@graph`, or nested beneath any property such as
  * `mainEntity`. Returns null when the value itself must be removed.
  */
-function pruneWebSites(value: unknown): unknown | null {
+function pruneDocsEntities(value: unknown): unknown | null {
   if (Array.isArray(value)) {
-    // pruneWebSites returns null for a droppable entry, so mapping then
+    // pruneDocsEntities returns null for a droppable entry, so mapping then
     // discarding nulls removes and recurses in one pass.
     return value
-      .map((entry) => pruneWebSites(entry))
+      .map((entry) => pruneDocsEntities(entry))
       .filter((entry) => entry !== null);
   }
   if (!value || typeof value !== 'object') return value;
+  if ((value as Record<string, unknown>)['@id'] === ORGANIZATION_ID) {
+    return { '@id': ORGANIZATION_ID };
+  }
   if (shouldDropWebSite(value)) return null;
 
   const node = collapseCanonicalWebSite(value as Record<string, unknown>);
@@ -249,17 +268,127 @@ function pruneWebSites(value: unknown): unknown | null {
 
   const next: Record<string, unknown> = {};
   for (const [key, nested] of Object.entries(node)) {
-    const pruned = pruneWebSites(nested);
+    const pruned = pruneDocsEntities(nested);
     if (pruned === null) continue;
     next[key] = pruned;
   }
   return next;
 }
 
-function rewriteDocsJsonLdValue(value: unknown): unknown | null {
-  const pruned = pruneWebSites(rewriteDocsWebsiteIds(value));
+function rewriteDocsJsonLdValue(
+  value: unknown,
+  pathname?: string,
+  allowArticleInjection = true,
+): unknown | null {
+  const pruned = pruneDocsEntities(rewriteDocsWebsiteIds(value));
   if (pruned === null) return null;
-  return withDocsArticleAuthor(withDocsSpeakable(pruned));
+  const attributed = withDocsArticleAuthor(withDocsSpeakable(pruned));
+  const withArticle = allowArticleInjection
+    ? withDocsArticleNode(attributed, pathname)
+    : attributed;
+  return withDocsArticleDates(withArticle, pathname);
+}
+
+function collectJsonLdNodes(value: unknown, into: Record<string, unknown>[] = []): Record<string, unknown>[] {
+  if (Array.isArray(value)) {
+    for (const entry of value) collectJsonLdNodes(entry, into);
+  } else if (value && typeof value === 'object') {
+    into.push(value as Record<string, unknown>);
+    for (const nested of Object.values(value)) collectJsonLdNodes(nested, into);
+  }
+  return into;
+}
+
+function hasDocsArticle(value: unknown): boolean {
+  return collectJsonLdNodes(value).some(
+    (node) => hasJsonLdType(node, 'Article') || hasJsonLdType(node, 'TechArticle'),
+  );
+}
+
+function documentHasDocsArticle(html: string): boolean {
+  for (const match of html.matchAll(JSON_LD_SCRIPT_RE)) {
+    try {
+      if (hasDocsArticle(JSON.parse(match[1] ?? ''))) return true;
+    } catch {
+      // The main rewrite logs parse failures and leaves those blocks untouched.
+    }
+  }
+  return false;
+}
+
+function docsSlugForPathname(pathname: string | undefined): string | null {
+  if (!pathname) return null;
+  const pair = resolveDocsLocalePair(pathname);
+  if (!pair) return null;
+  const active = pair.active === 'zh' ? pair.zhPath : pair.enPath;
+  const slug = active.replace(/^\/docs\//, '').replace(/\/$/, '');
+  return slug.length > 0 ? slug : null;
+}
+
+/**
+ * Backfill dateModified onto upstream Article nodes that lack it, from the
+ * same build-time manifest the injection path uses. An upstream shape flip
+ * that drops dates must not ship dateless articles silently; unknown slugs
+ * stay untouched rather than invented.
+ */
+function withDocsArticleDates(value: unknown, pathname?: string): unknown {
+  const slug = docsSlugForPathname(pathname);
+  const dateModified = slug ? DOCS_PAGE_DATES[slug] : undefined;
+  if (!dateModified) return value;
+  for (const node of collectJsonLdNodes(value)) {
+    if (
+      (hasJsonLdType(node, 'Article') || hasJsonLdType(node, 'TechArticle'))
+      && node.dateModified == null
+    ) {
+      node.dateModified = dateModified;
+    }
+  }
+  return value;
+}
+/**
+ * Inject a full Article node when upstream ships a bare WebPage. Every field
+ * is derived, never invented: headline/description/url from the page node,
+ * dateModified from the build-time manifest for this slug, publisher/author
+ * from the canonical Organization. Missing page name or missing manifest date
+ * means no injection — a dateless or nameless Article is worse than none.
+ */
+function withDocsArticleNode(value: unknown, pathname?: string): unknown {
+  const nodes = collectJsonLdNodes(value);
+  if (nodes.some((node) => hasJsonLdType(node, 'Article') || hasJsonLdType(node, 'TechArticle'))) {
+    return value;
+  }
+  const page = nodes.find((node) => hasJsonLdType(node, 'WebPage'));
+  if (!page || typeof page.name !== 'string' || page.name.trim().length === 0) return value;
+  const slug = docsSlugForPathname(pathname);
+  const dateModified = slug ? DOCS_PAGE_DATES[slug] : undefined;
+  if (!dateModified) return value;
+  const pageUrl = typeof page.url === 'string' && page.url.length > 0
+    ? page.url
+    : `${DOCS_PUBLIC_ORIGIN}${pathname ?? '/docs/'}`;
+  const article: Record<string, unknown> = {
+    '@type': ['Article', 'TechArticle'],
+    '@id': `${pageUrl}#article`,
+    headline: page.name,
+    dateModified,
+    publisher: { '@id': ORGANIZATION_ID },
+    author: { '@id': ORGANIZATION_ID },
+  };
+  if (typeof page.description === 'string' && page.description.trim().length > 0) {
+    article.description = page.description;
+  }
+  if (Array.isArray(value)) return [...value, article];
+  if (value && typeof value === 'object' && Array.isArray((value as Record<string, unknown>)['@graph'])) {
+    const host = value as Record<string, unknown>;
+    return { ...host, '@graph': [...(host['@graph'] as unknown[]), article] };
+  }
+  if (value && typeof value === 'object') {
+    const host = value as Record<string, unknown>;
+    return {
+      '@context': host['@context'] ?? 'https://schema.org',
+      '@graph': [host, article],
+    };
+  }
+  return value;
 }
 
 const DEFAULT_DOCS_SPEAKABLE = Object.freeze({
@@ -282,15 +411,15 @@ function withDocsSpeakable(value: unknown): unknown {
 }
 
 /**
- * Mintlify emits the docs page node as `["Article","TechArticle"]` carrying
- * `dateModified` and `publisher` but no `author`. Google requires `author` on
- * Article, so the docs — the site's deepest expertise asset — were
- * rich-result ineligible (#7530).
+ * Live upstream emits the docs page node as a bare WebPage with no Article
+ * (verified against production), so the docs — the site's deepest expertise
+ * asset — were rich-result ineligible. Inject the Article from the page node
+ * plus the build-time date manifest when both exist; never invent either half.
  *
- * The docs are product documentation with no per-page byline, so the canonical
- * Organization is the author. That matches how the research reports attribute
- * themselves (scripts/build-research-reports.mjs) and folds into the same
- * entity graph the WebSite retarget above joins.
+ * When upstream DOES emit an Article/TechArticle node, withDocsArticleAuthor
+ * below still attributes it to the canonical Organization (the docs are
+ * product documentation with no per-page byline, matching how the research
+ * reports attribute themselves in scripts/build-research-reports.mjs).
  *
  * `datePublished` is deliberately NOT synthesised. No per-page publication date
  * exists anywhere: docs/*.mdx frontmatter carries only title and description,
@@ -323,10 +452,12 @@ function withDocsArticleAuthor(value: unknown): unknown {
  * pathname-independent.
  */
 export function rewriteDocsEntityGraph(html: string, pathname?: string): string {
+  let articlePresent = documentHasDocsArticle(html);
   return html.replace(JSON_LD_SCRIPT_RE, (script, body: string) => {
     try {
-      const next = rewriteDocsJsonLdValue(JSON.parse(body));
+      const next = rewriteDocsJsonLdValue(JSON.parse(body), pathname, !articlePresent);
       if (next === null) return '';
+      articlePresent ||= hasDocsArticle(next);
       // Escape `<` so a `</script>` inside any string value cannot close the
       // element early. JSON.parse turns Mintlify's escaped `<\/script>` back
       // into a literal, and JSON.stringify would re-emit it raw. Mirrors
@@ -355,7 +486,7 @@ export function rewriteDocsLocaleHtml(html: string, pathname: string): string {
   const pair = resolveDocsLocalePair(pathname);
   if (!pair) return html;
 
-  let next = stripExistingDocsHreflang(html);
+  let next = rewriteDocsHeadLinks(html, pathname);
   if (pair.active === 'zh') {
     next = replaceHtmlLang(next, DOCS_ZH_HREFLANG);
     next = replaceOgLocale(next, 'zh_CN');
@@ -363,7 +494,6 @@ export function rewriteDocsLocaleHtml(html: string, pathname: string): string {
     next = replaceHtmlLang(next, DOCS_EN_HREFLANG);
     next = replaceOgLocale(next, 'en_US');
   }
-  next = injectAfterCanonical(next, buildDocsHreflangLinkTags(pathname));
   return rewriteDocsEntityGraph(next, pathname);
 }
 

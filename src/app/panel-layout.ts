@@ -44,7 +44,11 @@ import { BETA_MODE } from '@/config/beta';
 import { NQ_PULSE_DISCLOSURE } from '@/config/nq-context';
 import { t } from '@/services/i18n';
 import { getCurrentTheme } from '@/utils';
-import { trackCriticalBannerAction, trackCheckoutSuccess, trackCheckoutFailed, trackGateHit, trackMapViewChange, replayPendingCheckoutSuccess, replayPendingProFunnelEvents, replayPendingConversionEvents } from '@/services/analytics';
+import { trackCriticalBannerAction, trackCheckoutSuccess, trackCheckoutFailed, trackGateHit, trackMapViewChange, replayPendingCheckoutSuccess, replayPendingProFunnelEvents, replayPendingConversionEvents, replayPendingMissionReturn } from '@/services/analytics';
+import { ProPreviewSection } from '@/components/ProPreviewSection';
+import { syncPanelPreview } from '@/services/mission-preview-registry';
+import { loadStoredMissionPreset } from '@/services/mission-presets';
+import { peekPendingMissionAttribution } from '@/services/analytics';
 import { getStoredMapModePreference } from '@/services/map-mode-preference';
 import { loadWidgets, saveWidget, isProUser, isProTierResolved } from '@/services/widget-store';
 import { sanitizeLockedLayers, shouldSanitizeLockedLayers } from '@/config/map-layer-definitions';
@@ -126,6 +130,13 @@ import {
   hydrateTechHubPanelFromClusters,
 } from '@/app/hub-activity-hydration';
 import { movePanelToKeyboardZone } from '@/app/panel-keyboard-reorder';
+import { isCatalogPanelLive, waitUntilPanelLive } from '@/app/panel-enablement';
+import {
+  armCheckoutReturnState,
+  loadCheckoutReturnState,
+  settleCheckoutReturnFocus,
+} from '@/services/checkout-return-state';
+import { resolveCheckoutContext, type CheckoutContext } from '../../shared/checkout-attribution';
 
 function readSessionStorageValue(key: string): string | null {
   try {
@@ -222,7 +233,7 @@ const DASHBOARD_REFERENCE_LINKS = [
 ] as const;
 
 export const VARIANT_SWITCHER_DASHBOARD_URLS = {
-  full: 'https://worldmonitor.app/dashboard',
+  full: 'https://www.worldmonitor.app/dashboard',
   tech: 'https://tech.worldmonitor.app/dashboard',
   finance: 'https://finance.worldmonitor.app/dashboard',
   commodity: 'https://commodity.worldmonitor.app/dashboard',
@@ -463,6 +474,7 @@ export class PanelLayoutManager implements AppModule {
   private responsiveZoneListener: ResponsiveZoneListener | null = null;
   private readonly proActivationController: ProActivationController;
   private readonly passkeyOfferController: PasskeyOfferBoot;
+  private readonly checkoutReturnFocusController = new AbortController();
 
   constructor(ctx: AppContext, callbacks: PanelLayoutManagerCallbacks) {
     this.ctx = ctx;
@@ -497,9 +509,41 @@ export class PanelLayoutManager implements AppModule {
     // demand, keeping ~12 KB out of the first-paint chunk (see #7353 follow-up).
     this.passkeyOfferController = new PasskeyOfferBoot(ctx);
     if (returnedFromCheckout) {
+      const attempt = loadCheckoutAttempt();
+      const pendingAttribution = peekPendingMissionAttribution();
+      const checkoutContext: CheckoutContext | null = attempt?.context ?? (
+        pendingAttribution
+          ? resolveCheckoutContext({
+            surface: pendingAttribution.surface,
+            attribution: pendingAttribution.panelKey
+              ? { missionId: pendingAttribution.missionId, panelKey: pendingAttribution.panelKey }
+              : undefined,
+            ambientMissionId: pendingAttribution.missionId,
+          })
+          : null
+      );
+      if (checkoutContext) {
+        armCheckoutReturnState(
+          checkoutContext,
+          returnedFromDesktopBrowser
+            ? 'desktop-return'
+            : returnResult.kind === 'success'
+              ? 'url-return'
+              : 'overlay-flag',
+        );
+      }
       // Funnel (#4931): the purchase-complete signal on the client side.
       // Queued by the analytics facade until Umami loads after first paint.
       trackCheckoutSuccess(returnResult.kind === 'success' ? 'url-return' : 'overlay-flag');
+      // Mission return leg (plan U4/R1): a checkout that started from a
+      // mission preview lands the buyer back on the originating mission and
+      // panel. The stored preset re-applies itself on boot; here we finish
+      // the leg — scroll+focus the originating panel and emit the
+      // completion-side attribution event.
+      // The durable carrier is the CheckoutAttempt (still present here — the
+      // clearCheckoutAttempt('success') below runs after this branch). The
+      // pending-conversion peek is only a fallback: the collector usually
+      // confirms and clears that entry BEFORE the Dodo redirect.
       if (returnedFromAccountCheckout) {
         // Pro Activation Onboarding: capture the plan identity from the attempt
         // record and write the durable pending-onboarding marker BEFORE the
@@ -554,6 +598,7 @@ export class PanelLayoutManager implements AppModule {
     // are followed by a navigation (the Dodo redirect) that outlives any
     // in-page retry, so their durable markers replay here too.
     replayPendingConversionEvents();
+    replayPendingMissionReturn();
 
     // Always register the payment-failure-banner listener — onSubscriptionChange
     // is an in-memory listener registry, doesn't open any network connection,
@@ -673,6 +718,7 @@ export class PanelLayoutManager implements AppModule {
   async init(): Promise<void> {
     await this.renderLayout();
     if (this.ctx.isDestroyed) return;
+    void this.reconcileCheckoutReturnFocus();
 
     // Subscribe to auth state for reactive panel gating on web
     this.unsubscribeAuth = subscribeAuthState((state) => {
@@ -727,7 +773,47 @@ export class PanelLayoutManager implements AppModule {
     window.setTimeout(() => this.revealAnalystPanel(attemptsLeft - 1), 80);
   }
 
+  private async reconcileCheckoutReturnFocus(): Promise<void> {
+    const state = loadCheckoutReturnState();
+    if (!state || state.delivery.panelFocus !== 'pending') return;
+    if (state.context.origin.kind !== 'mission-preview') return;
+
+    const panelKey = state.context.origin.panelKey;
+    const escaped = typeof CSS !== 'undefined' && typeof CSS.escape === 'function'
+      ? CSS.escape(panelKey)
+      : panelKey.replace(/["\\]/g, '\\$&');
+    document.querySelector<HTMLElement>(`[data-panel="${escaped}"]`)?.scrollIntoView({
+      block: 'start',
+      behavior: 'smooth',
+    });
+
+    try {
+      const outcome = await waitUntilPanelLive({
+        isLive: () => isCatalogPanelLive(panelKey, this.ctx.panels),
+        signal: this.checkoutReturnFocusController.signal,
+      });
+      if (outcome !== 'live' || this.ctx.isDestroyed) return;
+      const panel = this.ctx.panels[panelKey] as { getElement?: () => HTMLElement | null } | undefined;
+      const instanceElement = panel?.getElement?.();
+      const element = instanceElement?.isConnected
+        ? instanceElement
+        : document.querySelector<HTMLElement>(
+          `[data-panel="${escaped}"]:not([data-deferred-panel])`,
+        );
+      if (!element?.isConnected || element.hasAttribute('data-deferred-panel')) return;
+      element.scrollIntoView({ block: 'start', behavior: 'smooth' });
+      element.tabIndex = -1;
+      element.focus({ preventScroll: true });
+      settleCheckoutReturnFocus();
+    } catch (error) {
+      if ((error as { name?: string }).name !== 'AbortError') {
+        console.warn('[checkout] Failed to restore preview panel focus', error);
+      }
+    }
+  }
+
   destroy(): void {
+    this.checkoutReturnFocusController.abort();
     clearAllPendingCalls();
     this.applyTimeRangeFilterDebounced.cancel();
     this.unsubscribeAuth?.();
@@ -806,6 +892,10 @@ export class PanelLayoutManager implements AppModule {
 
     // Destroy every registered panel exactly once, including lazy-created
     // and self-fetching panels that own subscriptions, intervals, or aborts.
+    for (const preview of this.missionPreviews.values()) {
+      preview.destroy();
+    }
+    this.missionPreviews.clear();
     for (const panel of Object.values(this.ctx.panels)) {
       destroyOnce(panel);
     }
@@ -945,8 +1035,11 @@ export class PanelLayoutManager implements AppModule {
       }
     })();
     const bootShellFootprint = import.meta.env.DEV ? captureBootShellFootprint(this.ctx.container) : null;
+    const referenceOrigin = this.ctx.isDesktopApp || window.location.hostname.endsWith('.worldmonitor.app')
+      ? 'https://www.worldmonitor.app'
+      : '';
     const referenceLinksHtml = DASHBOARD_REFERENCE_LINKS.map(({ label, path }) => {
-      const href = this.ctx.isDesktopApp ? `https://www.worldmonitor.app${path}` : path;
+      const href = `${referenceOrigin}${path}`;
       return `<a href="${href}" target="_blank" rel="noopener">${label}</a>`;
     }).join('');
 
@@ -1019,7 +1112,7 @@ export class PanelLayoutManager implements AppModule {
               <span class="variant-label">Good News</span>
             </a>`;
       })()}</div>
-          <span class="logo">MONITOR</span><span class="logo-mobile">World Monitor</span><span class="version">v${__APP_VERSION__}</span>${BETA_MODE ? '<span class="beta-badge">BETA</span>' : ''}
+          <span class="logo">COMMAND CENTER</span><span class="logo-mobile">Command Center</span><span class="version">v${__APP_VERSION__}</span>${BETA_MODE ? '<span class="beta-badge">BETA</span>' : ''}
           <a href="https://x.com/eliehabib" target="_blank" rel="noopener" class="credit-link">
             <svg class="x-logo" width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24H16.17l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25H8.08l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z"/></svg>
             <span class="credit-text">@eliehabib</span>
@@ -1064,7 +1157,7 @@ export class PanelLayoutManager implements AppModule {
       <div class="mobile-menu-overlay" id="mobileMenuOverlay"></div>
       <nav class="mobile-menu" id="mobileMenu" aria-label="Menu">
         <div class="mobile-menu-header">
-          <span class="mobile-menu-title">WORLD MONITOR</span>
+          <span class="mobile-menu-title">COMMAND CENTER</span>
           <button class="mobile-menu-close" id="mobileMenuClose" aria-label="Close menu">
             <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
           </button>
@@ -1120,9 +1213,9 @@ export class PanelLayoutManager implements AppModule {
         <div class="mobile-menu-divider"></div>
         <div class="mobile-menu-footer-links">
           ${referenceLinksHtml}
-          <a href="${this.ctx.isDesktopApp ? 'https://www.worldmonitor.app/pro#pricing' : '/pro#pricing'}" target="_blank" rel="noopener">Pricing</a>
-          <a href="${this.ctx.isDesktopApp ? 'https://worldmonitor.app/blog/' : 'https://www.worldmonitor.app/blog/'}" target="_blank" rel="noopener">Blog</a>
-          <a href="${this.ctx.isDesktopApp ? 'https://worldmonitor.app/docs' : 'https://www.worldmonitor.app/docs'}" target="_blank" rel="noopener">Docs</a>
+          <a href="${referenceOrigin}/pro#pricing" target="_blank" rel="noopener">Pricing</a>
+          <a href="https://www.worldmonitor.app/blog/" target="_blank" rel="noopener">Blog</a>
+          <a href="https://www.worldmonitor.app/docs/documentation" target="_blank" rel="noopener">Docs</a>
           <a href="https://status.worldmonitor.app/" target="_blank" rel="noopener">Status</a>
         </div>
         <div class="mobile-menu-version">v${__APP_VERSION__}</div>
@@ -1202,15 +1295,15 @@ export class PanelLayoutManager implements AppModule {
         <div class="site-footer-brand">
           <img src="/favico/android-chrome-96x96.png" alt="" width="28" height="28" loading="lazy" decoding="async" class="site-footer-icon" />
           <div class="site-footer-brand-text">
-            <span class="site-footer-name">WORLD MONITOR</span>
+            <span class="site-footer-name">AI NOMADS WORLD COMMAND CENTER</span>
             <span class="site-footer-sub">v${__APP_VERSION__} &middot; <a href="https://x.com/eliehabib" target="_blank" rel="noopener" class="site-footer-credit">@eliehabib</a></span>
           </div>
         </div>
         <nav aria-label="World Monitor references">
           ${referenceLinksHtml}
-          <a href="${this.ctx.isDesktopApp ? 'https://www.worldmonitor.app/pro#pricing' : '/pro#pricing'}" target="_blank" rel="noopener">Pricing</a>
-          <a href="${this.ctx.isDesktopApp ? 'https://worldmonitor.app/blog/' : 'https://www.worldmonitor.app/blog/'}" target="_blank" rel="noopener">Blog</a>
-          <a href="${this.ctx.isDesktopApp ? 'https://worldmonitor.app/docs' : 'https://www.worldmonitor.app/docs'}" target="_blank" rel="noopener">Docs</a>
+          <a href="${referenceOrigin}/pro#pricing" target="_blank" rel="noopener">Pricing</a>
+          <a href="https://www.worldmonitor.app/blog/" target="_blank" rel="noopener">Blog</a>
+          <a href="https://www.worldmonitor.app/docs/documentation" target="_blank" rel="noopener">Docs</a>
           <a href="https://status.worldmonitor.app/" target="_blank" rel="noopener">Status</a>
           <a href="https://github.com/koala73/worldmonitor" target="_blank" rel="noopener">GitHub</a>
           <a href="https://discord.gg/re63kWKxaz" target="_blank" rel="noopener">Discord</a>
@@ -2163,6 +2256,7 @@ export class PanelLayoutManager implements AppModule {
       }
     });
     this.mobilePanelNav?.refresh();
+    this.syncAllMissionPreviews();
   }
 
   /**
@@ -2317,6 +2411,36 @@ export class PanelLayoutManager implements AppModule {
     }
   }
 
+  private missionPreviews = new Map<string, ProPreviewSection>();
+
+  /**
+   * Keep each mounted panel's Pro preview in sync with the ACTIVE mission
+   * (plan U5). The registry is the only authority: a preview exists exactly
+   * when the active mission's entry targets this panel, so a mission switch,
+   * a reset, or a registry rollback all converge through this one seam.
+   * Attached as a sibling AFTER the panel's content, so the panel's own
+   * content re-renders never touch it.
+   */
+  private syncMissionPreview(key: string, panel: Panel, activeMissionId?: string | null): void {
+    const missionId = activeMissionId !== undefined ? activeMissionId : (loadStoredMissionPreset()?.id ?? null);
+    syncPanelPreview(
+      this.missionPreviews,
+      key,
+      panel.getElement(),
+      missionId,
+      (spec) => new ProPreviewSection(spec),
+    );
+  }
+
+  private syncAllMissionPreviews(): void {
+    // One preset read for the whole board — this runs on every
+    // applyPanelSettings call, mission or not (hot-path rule).
+    const missionId = loadStoredMissionPreset()?.id ?? null;
+    for (const [key, panel] of Object.entries(this.ctx.panels)) {
+      if (panel) this.syncMissionPreview(key, panel, missionId);
+    }
+  }
+
   private mountPanelElement(grid: HTMLElement, key: string, panel: Panel, placeholder?: HTMLElement | null): boolean {
     const el = panel.getElement();
     if (el.parentElement) return false;
@@ -2330,6 +2454,7 @@ export class PanelLayoutManager implements AppModule {
     }
     this.mobilePanelNav?.applyToNewPanel(el);
     panel.notifyConnected();
+    this.syncMissionPreview(key, panel);
     return true;
   }
 

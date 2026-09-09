@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import test from 'node:test';
+import { latestValidGithubStarsSnapshot } from '../scripts/github-stars-snapshot.mjs';
 import { guardProBuiltOutput, shouldSkipProBuiltOutput } from './_lib/pro-built-output.mjs';
 
 let cachedWelcomeHtml;
@@ -43,6 +44,9 @@ test('welcome FAQPage JSON-LD matches every visible FAQ entry', { skip }, () => 
     assert.equal(entry.name, en.welcome.faq[`q${n}`]);
     assert.equal(entry.acceptedAnswer?.text, en.welcome.faq[`a${n}`]);
   }
+  // The structured answer to the Liveuamap question must carry the compare
+  // destination itself, not only the DOM anchor derived from it (#7746).
+  assert.match(faqPage.mainEntity[4].acceptedAnswer.text, /worldmonitor\.app\/compare\/liveuamap-alternatives/);
 });
 
 test('welcome JSON-LD connects the page, website, application, and publisher', { skip }, () => {
@@ -88,17 +92,23 @@ test('built welcome page ships the real hero in #root before JavaScript', { skip
   assert.match(rootContent, /Which World Monitor license do I need\?/);
   assert.match(rootContent, /API Business lets that organization embed World Monitor data/);
   assert.match(rootContent, /href="\/docs\/terms"[^>]*>worldmonitor\.app\/docs\/terms<\/a>/);
+  // The Liveuamap FAQ is the homepage's one link into the /compare/ family;
+  // it has to survive prerender so non-JS crawlers see it (#7746).
+  const faqStart = rootContent.indexOf('id="faq"');
+  assert.ok(faqStart >= 0, 'the FAQ section must be prerendered');
+  const faqContent = rootContent.slice(faqStart);
+  assert.match(faqContent, /href="\/compare\/liveuamap-alternatives\/"[^>]*>worldmonitor\.app\/compare\/liveuamap-alternatives<\/a>/);
   assert.match(rootContent, /href="\/sources\/\?utm_source=welcome-hero"/);
   assert.match(rootContent, /href="\/sources\/\?utm_source=welcome-depth"/);
   assert.match(rootContent, /href="\/sources\/\?utm_source=welcome-footer"[^>]*>Sources<\/a>/);
-  assert.match(rootContent, /Map layers/);
+  assert.match(rootContent, /Map layer types/);
   const navContent = rootContent.slice(
     rootContent.indexOf('<nav'),
     rootContent.indexOf('</nav>') + '</nav>'.length,
   );
   assert.match(navContent, /href="\/blog\/"/);
   assert.match(navContent, />Blog<\/a>/);
-  assert.match(navContent, /href="\/sources\/\?utm_source=welcome-nav"[^>]*>Sources<\/a>/);
+  assert.match(navContent, /href="\/sources\/\?utm_source=welcome-nav"[^>]*>Attributed providers<\/a>/);
   assert.match(navContent, /id="welcome-tablet-navigation"/);
   assert.match(navContent, />Menu</);
   const headlineIndex = rootContent.indexOf('By the time it&#x27;s news,');
@@ -147,4 +157,64 @@ test('built welcome page prerenders task routes and agent discovery links', { sk
   for (const linkPattern of agentLinks) {
     assert.match(agentSection, linkPattern);
   }
+});
+
+test('built welcome SoftwareApplication carries the snapshot star InteractionCounter', { skip }, () => {
+  const snapshot = latestValidGithubStarsSnapshot();
+  const application = welcomeJsonLdBlocks().find((block) => block['@type'] === 'SoftwareApplication');
+  assert.ok(application, 'welcome.html should include SoftwareApplication JSON-LD');
+  assert.deepEqual(application.interactionStatistic, {
+    '@type': 'InteractionCounter',
+    interactionType: 'https://schema.org/LikeAction',
+    name: 'GitHub stars',
+    userInteractionCount: snapshot.stargazers_count,
+  });
+  assert.doesNotMatch(welcomeHtml(), /%GITHUB_STARS_INTERACTION%/);
+});
+
+test('hero proof rail renders measured numerals with extractable labels', { skip }, () => {
+  const facts = JSON.parse(readFileSync(new URL('../shared/product-facts.generated.json', import.meta.url), 'utf8'));
+  const { content } = welcomeRoot();
+  for (const [value, label] of [
+    [String(facts.heroProofStats.mapLayers), 'Map layer types'],
+    [String(facts.heroProofStats.feeds), 'News &amp; OSINT feeds'],
+    [String(facts.heroProofStats.providers), 'Attributed providers'],
+    [String(facts.heroProofStats.alertOrigins), 'Independent alert origins'],
+  ]) {
+    assert.ok(content.includes(`>${value}</div>`), `hero rail must render the numeral ${value}`);
+    assert.ok(content.includes(label), `hero rail must label the numeral ${label}`);
+  }
+  const railStart = content.indexOf('sm:max-w-3xl grid-cols-2');
+  assert.ok(railStart > 0, 'hero proof rail markup must be present');
+  const rail = content.slice(railStart, content.indexOf('mt-8 flex', railStart));
+  assert.doesNotMatch(rail, />(Shared|Curated|Attributed)</, 'hero numeral slots must not render adjectives');
+});
+
+test('homepage answers "What is World Monitor?" and carries page date metadata', { skip }, () => {
+  const html = welcomeHtml();
+  const heading = html.match(/<h2[^>]*>What is World Monitor\?<\/h2>\s*<p[^>]*>([\s\S]*?)<\/p>/);
+  assert.ok(heading, 'homepage must define World Monitor under an answer-style H2');
+  const words = heading[1].replace(/<[^>]+>/g, '').trim().split(/\s+/).length;
+  assert.ok(words >= 40 && words <= 60, `definition must be 40-60 words, got ${words}`);
+  assert.match(html, /<meta name="lastmod" content="\d{4}-\d{2}-\d{2}"\s*\/>/);
+});
+
+test('built welcome teaser strip badges the snapshot as a published pulse (#7654)', { skip }, () => {
+  // The prerender bakes the fallback rows, which are a frozen capture of real
+  // published data (#7608) — a crawler must read them as an attributable
+  // snapshot, never a sample.
+  const { content: rootContent } = welcomeRoot();
+  assert.match(rootContent, /data-live-updated/, 'strip badges must carry the corpus live-updated marker');
+  assert.match(rootContent, /Published pulse \w{3} \d{1,2}, \d{4}/, 'strip badges must name the freeze date');
+  assert.match(rootContent, /Enable JavaScript to refresh/, 'strip must carry the corpus refresh affordance');
+  assert.doesNotMatch(rootContent, />Sample</, 'no card may badge real snapshot rows as a sample');
+});
+
+test('built welcome lastmod tracks the teaser strip snapshot (#7654)', { skip }, () => {
+  const teasers = JSON.parse(readFileSync(new URL('../pro-test/src/generated/teasers.json', import.meta.url), 'utf8'));
+  assert.match(
+    welcomeHtml(),
+    new RegExp(`<meta name="lastmod" content="${teasers.capturedAt}"`),
+    'served homepage lastmod must be the snapshot capture date behind the strip',
+  );
 });

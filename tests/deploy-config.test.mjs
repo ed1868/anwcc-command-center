@@ -4,13 +4,42 @@ import { createHash } from 'node:crypto';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { readFileSync as originalReadFileSync, existsSync, readdirSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname, join, resolve } from 'node:path';
+import { dirname, join, relative, resolve } from 'node:path';
 function readFileSync(path, options) {
   const content = originalReadFileSync(path, options);
   if (typeof content === 'string') {
     return content.replace(/\r\n/g, '\n');
   }
   return content;
+}
+
+// Consecutive User-agent lines share one robots.txt group. A blank line, or a
+// User-agent line after rules, starts a new group; comments do not end a group.
+function parseRobotsGroups(source) {
+  const groups = [];
+  let current = null;
+  for (const raw of source.split('\n')) {
+    const line = raw.trim();
+    if (line === '') {
+      current = null;
+      continue;
+    }
+    if (line.startsWith('#')) continue;
+    const colon = line.indexOf(':');
+    if (colon === -1) continue;
+    const key = line.slice(0, colon).trim().toLowerCase();
+    const value = line.slice(colon + 1).trim();
+    if (key === 'user-agent') {
+      if (!current || current.rules.length > 0) {
+        current = { agents: [], rules: [] };
+        groups.push(current);
+      }
+      current.agents.push(value.toLowerCase());
+    } else if (current && (key === 'allow' || key === 'disallow')) {
+      current.rules.push(`${key}: ${value}`);
+    }
+  }
+  return groups;
 }
 import { fileURLToPath } from 'node:url';
 import { guardProBuiltOutput, shouldSkipProBuiltOutput, withoutUnbuiltProPaths } from './_lib/pro-built-output.mjs';
@@ -20,6 +49,7 @@ import {
   discoverContentCorpusPages,
 } from '../scripts/discover-content-corpus-pages.mjs';
 import { guardBuiltOutput, shouldSkipBuiltOutput } from './_lib/built-output-guard.mjs';
+import { AGENT_TEXT_FILES } from '../scripts/cloudflare-cache-rule.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const packageJson = JSON.parse(readFileSync(resolve(__dirname, '../package.json'), 'utf-8'));
@@ -34,7 +64,7 @@ const webMcpCancellationE2eSource = readFileSync(
   'utf-8',
 );
 const testWorkflowSource = readFileSync(resolve(__dirname, '../.github/workflows/test.yml'), 'utf-8');
-const sitemapSource = readFileSync(resolve(__dirname, '../public/sitemap.xml'), 'utf-8');
+const sitemapSource = readFileSync(resolve(__dirname, '../public/sitemap-main.xml'), 'utf-8');
 const robotsSource = readFileSync(resolve(__dirname, '../public/robots.www.txt'), 'utf-8');
 const mainSource = readFileSync(resolve(__dirname, '../src/main.ts'), 'utf-8');
 const zodCspSource = readFileSync(resolve(__dirname, '../src/bootstrap/zod-csp.ts'), 'utf-8');
@@ -46,7 +76,7 @@ const frontendDockerfileSource = readFileSync(resolve(__dirname, '../docker/Dock
 const dockerignoreSource = readFileSync(resolve(__dirname, '../.dockerignore'), 'utf-8');
 const vercelIgnoreSource = readFileSync(resolve(__dirname, '../scripts/vercel-ignore.sh'), 'utf-8');
 const variantDashboardSource = readFileSync(resolve(__dirname, '../src/config/variant-dashboard-html.ts'), 'utf-8');
-const SPA_HTML_CACHE_SOURCE = '/((?!api|mcp|a2a|ask|oauth|assets|blog|docs|country-instability-index|countries|chokepoints|crises|tools|research|reference|changelog|sources|use-cases|src|tmp|server|embed|embed\\.html|favico|map-styles|data|textures|pro|sw\\.js|workbox-[a-f0-9]+\\.js|manifest\\.webmanifest|offline\\.html|robots\\.txt|robots\\.www\\.txt|robots\\.variant\\.txt|robots\\.api\\.txt|sitemap\\.xml|schemamap\\.xml|sandbox|llms\\.txt|llms-full\\.txt|llms\\*\\.txt|openapi\\.yaml|openapi\\.json|plugin\\.json|auth\\.md|pricing\\.md|support\\.md|ai-search\\.md|agents\\.md|developers\\.md|developers/llms\\.txt|mcp-server\\.md|openapi\\.md|sdks\\.md|world-monitor\\.md|api-versioning\\.md|agent\\.txt|\\.well-known|wm-widget-sandbox\\.html|mcp-grant\\.html|mcp-grant|.*\\.md$).*)';
+const SPA_HTML_CACHE_SOURCE = '/((?!api|mcp|a2a|ask|oauth|assets|blog|docs|country-instability-index|countries|chokepoints|compare|crises|tools|research|reference|changelog|sources|use-cases|src|tmp|server|embed|embed\\.html|favico|map-styles|data|textures|pro|sw\\.js|workbox-[a-f0-9]+\\.js|manifest\\.webmanifest|offline\\.html|robots\\.txt|robots\\.www\\.txt|robots\\.variant\\.txt|robots\\.api\\.txt|sitemap\\.xml|sitemap-main\\.xml|schemamap\\.xml|sandbox|llms\\.txt|llms-full\\.txt|llms\\*\\.txt|openapi\\.yaml|openapi\\.json|plugin\\.json|auth\\.md|pricing\\.md|support\\.md|ai-search\\.md|agents\\.md|developers\\.md|developers/llms\\.txt|mcp-server\\.md|openapi\\.md|sdks\\.md|world-monitor\\.md|api-versioning\\.md|agent\\.txt|\\.well-known|wm-widget-sandbox\\.html|mcp-grant\\.html|mcp-grant|.*\\.md$).*)';
 const GLOBAL_SECURITY_HEADER_SOURCE = '/((?!docs|embed|embed\\.html|wm-widget-sandbox\\.html).*)';
 const APP_ROOT_HOST_PATTERN = '^(?:(?:www|tech|finance|commodity|happy|energy)\\.)?worldmonitor\\.app$';
 const WEBMCP_PRODUCTION_HOST_PATTERN = '^(?:www|tech|finance|commodity|happy|energy)\\.worldmonitor\\.app$';
@@ -526,7 +556,7 @@ describe('crawlable content corpus deployment contracts', () => {
       );
       assert.ok(
         script.indexOf('npm run build:sitemap') < script.indexOf('vite build'),
-        scriptName + ' must update public/sitemap.xml before Vite copies public/ into dist/'
+        scriptName + ' must update the public sitemap index and urlset before Vite copies public/ into dist/'
       );
       // public/pro/ is a BUILD PRODUCT, not committed bytes (#6898). Vercel's
       // build command is `npm run build:full`, so if that chain stops running
@@ -563,7 +593,7 @@ describe('crawlable content corpus deployment contracts', () => {
       );
       assert.ok(
         source.indexOf('npm run build:sitemap') < source.indexOf('npx vite build'),
-        name + ' must update public/sitemap.xml before Vite copies public/ into dist/'
+        name + ' must update the public sitemap index and urlset before Vite copies public/ into dist/'
       );
       // Unlike /blog (deliberately skipped in the images), docker/nginx.conf.template
       // routes `location ^~ /pro` and `/pro/assets/`, so a self-hosted image that
@@ -605,6 +635,9 @@ describe('crawlable content corpus deployment contracts', () => {
     assert.ok(vercelIgnoreSource.includes("'docs/snapshots/'"));
     for (const path of [
       'docs/docs.json',
+      'scripts/build-comparison-pages.mjs',
+      'scripts/comparison-page-narratives.mjs',
+      'scripts/unranked-country-inventory.mjs',
       'scripts/build-use-cases.mjs',
       'scripts/crawlable-sources-page.mjs',
       'scripts/source-origin.mjs',
@@ -635,6 +668,9 @@ describe('crawlable content corpus deployment contracts', () => {
 
       for (const path of [
         'docs/docs.json',
+        'scripts/build-comparison-pages.mjs',
+      'scripts/comparison-page-narratives.mjs',
+        'scripts/unranked-country-inventory.mjs',
         'scripts/build-use-cases.mjs',
         'scripts/crawlable-sources-page.mjs',
         'scripts/source-origin.mjs',
@@ -688,6 +724,19 @@ describe('crawlable content corpus deployment contracts', () => {
 
     for (const path of ['docker-compose.override.yml', 'secrets/']) {
       assert.ok(ignoreRules.has(path), `${path} must never enter Docker build contexts or caches`);
+    }
+  });
+
+  it('marks stock workspaces and their markdown twins noindex without breaking deep links (#7905)', () => {
+    for (const path of ['/stocks', '/stocks/', '/stocks.md', '/stocks/AAPL', '/stocks/ZZZZFAKE',
+      '/stocks/aapl/', '/stocks/BRK.B', '/stocks/7203.T', '/stocks/AAPL.md', '/stocks/ZZZZFAKE.md']) {
+      assert.equal(effectiveHeader(path, 'X-Robots-Tag'), 'noindex, follow', path);
+    }
+    for (const path of ['/dashboard', '/stocksmith', '/countries/united-states']) {
+      assert.equal(effectiveHeader(path, 'X-Robots-Tag'), null, path);
+    }
+    for (const symbol of ['AAPL', 'ZZZZFAKE', 'BRK.B', '7203.T']) {
+      assert.equal(firstRewriteFor({ host: 'www.worldmonitor.app', path: `/stocks/${symbol}` })?.destination, DASHBOARD_HTML_DESTINATION);
     }
   });
 
@@ -792,7 +841,20 @@ describe('crawlable content corpus deployment contracts', () => {
         assert.equal(
           effectiveHeader(route, 'CDN-Cache-Control'),
           HTML_ENTRY_EDGE_CACHE,
-          `${route} must advertise the 600s Cloudflare TTL; without it Cloudflare answers DYNAMIC and never caches the page`,
+          // Necessary but not sufficient — and this suite has now been the green
+          // half of that pair twice in two days, one layer apart:
+          //   #7590 (2026-09-03): the `:param*` source never matched the corpus's
+          //     trailing-slash URLs, so all ~22 rules were inert at Vercel while
+          //     the model here matched both forms and stayed green.
+          //   #7659 (2026-09-04): the header was finally reaching production and
+          //     Cloudflare still answered DYNAMIC, because a zone cache rule had
+          //     already declared the response ineligible — origin headers get no
+          //     vote once that happens.
+          // The lesson both times: no assertion over vercel.json can see whether a
+          // layer downstream honoured it. The live counterpart is the corpus probe
+          // in tests/live-api-cache-auth-regression.test.mjs, and the rule itself is
+          // scripts/cloudflare-cache-rule.mjs (tests/cloudflare-cache-rule.test.mjs).
+          `${route} must advertise the 600s Cloudflare TTL; without it the zone cache rule has no TTL to honour`,
         );
         assert.equal(
           effectiveHeader(route, 'Vercel-CDN-Cache-Control'),
@@ -808,10 +870,83 @@ describe('crawlable content corpus deployment contracts', () => {
     }
   });
 
+  it('advertises the edge cache on the blog, the proxied docs and the root agent text files (#7747)', () => {
+    // The vercel.json half of the pair. The Cloudflare half is
+    // scripts/cloudflare-cache-rule.mjs, and tests/cloudflare-cache-rule.test.mjs
+    // fails when the two halves cover different surfaces.
+    for (const route of ['/blog', '/blog/', '/blog/glossary/ais/', '/blog/rss.xml', '/blog/llms.txt', '/blog/sitemap-index.xml']) {
+      assert.equal(effectiveHeader(route, 'CDN-Cache-Control'), HTML_ENTRY_EDGE_CACHE, `${route} must advertise the 600s Cloudflare TTL`);
+      assert.equal(effectiveHeader(route, 'Vercel-CDN-Cache-Control'), HTML_ENTRY_EDGE_CACHE, `${route} must advertise the 600s Vercel TTL`);
+    }
+    // Blog assets keep their own policies: immutable hashed bundles, and the
+    // zone's month-long "Blog" rule for OG and post images. A shared 600s TTL
+    // would shorten Vercel's cache of the bundles and make the document rule the
+    // last writer of edge_ttl for the images.
+    for (const route of ['/blog/_astro/index.abc123.js', '/blog/og/post.png', '/blog/images/post.png']) {
+      assert.equal(effectiveHeader(route, 'CDN-Cache-Control'), null, `${route} must not inherit the document TTL`);
+      assert.equal(effectiveHeader(route, 'Vercel-CDN-Cache-Control'), null, `${route} must not inherit the document TTL`);
+    }
+    assert.equal(effectiveCacheControl('/blog/_astro/index.abc123.js'), 'public, max-age=31536000, immutable');
+
+    // /docs is a proxy to Mintlify, which negotiates markdown on Accept without
+    // a matching Vary and serves RSC flights at the document URL. Cloudflare gets
+    // the TTL and keys the negotiating requests out in the zone rule; Vercel's
+    // own cache must not store these at all, because it would key HTML and
+    // markdown under one URL. Vercel strips Vercel-CDN-Cache-Control before the
+    // response leaves, so the browser never sees the no-store.
+    for (const route of ['/docs/documentation', '/docs/mcp-overview', '/docs/zh/about/', '/docs/documentation.md', '/docs/sitemap.xml']) {
+      assert.equal(effectiveHeader(route, 'CDN-Cache-Control'), HTML_ENTRY_EDGE_CACHE, `${route} must advertise the 600s Cloudflare TTL`);
+      assert.equal(effectiveHeader(route, 'Vercel-CDN-Cache-Control'), 'no-store', `${route} must keep Vercel's cache out of the Mintlify proxy`);
+      assert.equal(effectiveHeader(route, 'X-Content-Type-Options'), 'nosniff', `${route} must still carry the docs security headers`);
+    }
+    for (const route of ['/docs/mcp', '/docs/mcp/', '/docs/mcp/session', '/docs/_next/static/chunks/a.js', '/docs/_mintlify/favicons/a.png']) {
+      assert.equal(effectiveHeader(route, 'CDN-Cache-Control'), null, `${route} is not a document and must not advertise the TTL`);
+      assert.equal(effectiveHeader(route, 'Vercel-CDN-Cache-Control'), null, `${route} is not a document and must not carry a Vercel cache policy`);
+    }
+
+    // The sitemaps joined AGENT_TEXT_FILES in #7869 and keep the stricter
+    // browser policy they have always had — the crawler that re-fetches a
+    // sitemap wants a revalidation, and the shared edge TTL is unaffected.
+    const SITEMAPS = new Set(['sitemap.xml', 'sitemap-main.xml']);
+    for (const file of AGENT_TEXT_FILES) {
+      const route = `/${file}`;
+      assert.equal(effectiveHeader(route, 'CDN-Cache-Control'), HTML_ENTRY_EDGE_CACHE, `${route} must advertise the 600s Cloudflare TTL`);
+      assert.equal(effectiveHeader(route, 'Vercel-CDN-Cache-Control'), HTML_ENTRY_EDGE_CACHE, `${route} must advertise the 600s Vercel TTL`);
+      assert.equal(
+        effectiveCacheControl(route),
+        SITEMAPS.has(file) ? 'public, max-age=3600, must-revalidate' : 'public, max-age=3600',
+        `${route} must keep its browser policy`,
+      );
+      assert.ok(existsSync(resolve(__dirname, '../public', file)), `${route} must be a static file in public/`);
+    }
+    // /index.md reaches the origin under its own name and is rewritten to
+    // /home.md there; robots.txt is left to the zone bypass on purpose (it is
+    // re-fetched rarely and cheap to serve); the nested llms.txt twins are not
+    // root files. /schemamap.xml is not in the sitemap index and no crawler is
+    // pointed at it.
+    for (const route of ['/index.md', '/robots.txt', '/schemamap.xml', '/api/download.md', '/developers/llms.txt']) {
+      assert.equal(effectiveHeader(route, 'CDN-Cache-Control'), null, `${route} must not advertise the document TTL`);
+    }
+  });
+
   it('keeps robots.txt advertising root, blog, and Mintlify docs sitemaps', () => {
     assert.match(robotsSource, /^Sitemap: https:\/\/www\.worldmonitor\.app\/sitemap\.xml$/m);
     assert.match(robotsSource, /^Sitemap: https:\/\/www\.worldmonitor\.app\/blog\/sitemap-index\.xml$/m);
     assert.match(robotsSource, /^Sitemap: https:\/\/www\.worldmonitor\.app\/docs\/sitemap\.xml$/m);
+  });
+
+  // #7749 gave the sitemaps the Vercel half of the pair and deliberately left
+  // the Cloudflare bypass alone. Round 7 then measured both still DYNAMIC under
+  // a GET while every other corpus route hit, which is what the half-pair
+  // predicts: the bypass rule names /sitemap.xml and .xml is outside
+  // Cloudflare's default-cacheable extensions. #7869 completes the pair — the
+  // claim lives in scripts/cloudflare-cache-rule.mjs (AGENT_TEXT_FILES).
+  it('caches root sitemaps at both shared caches (#7869, supersedes #7749)', () => {
+    for (const route of ['/sitemap.xml', '/sitemap-main.xml']) {
+      assert.equal(effectiveCacheControl(route), 'public, max-age=3600, must-revalidate');
+      assert.equal(effectiveHeader(route, 'Vercel-CDN-Cache-Control'), HTML_ENTRY_EDGE_CACHE);
+      assert.equal(effectiveHeader(route, 'CDN-Cache-Control'), HTML_ENTRY_EDGE_CACHE);
+    }
   });
 
   it('keeps the root sitemap generated while delegating blog and docs inventories', () => {
@@ -1178,36 +1313,6 @@ describe('welcome landing page routing', () => {
     }
   });
 
-  it('keeps variant social-preview canonicals aligned with variant metadata', () => {
-    const variantUrls = getVariantUrls();
-    const nonFullUrls = Object.entries(variantUrls).filter(([variant]) => variant !== 'full');
-
-    for (const [variant, url] of nonFullUrls) {
-      assert.match(
-        middlewareSource,
-        new RegExp(`\\b${variant}:\\s*\\{[\\s\\S]*?url:\\s*'${escapeRegExp(url)}'`),
-        `${variant} social-preview OG/canonical URL must match variant-meta.ts`
-      );
-    }
-
-    assert.match(
-      middlewareSource,
-      /const og = VARIANT_OG\[variant as keyof typeof VARIANT_OG\]/,
-      'social-preview metadata must come from the variant registry',
-    );
-    assert.match(
-      middlewareSource,
-      /escHtml\(og\.url\)/,
-      'social-preview URLs must stay HTML-escaped',
-    );
-    assert.match(
-      middlewareSource,
-      /path === '\/' && SOCIAL_PREVIEW_UA\.test\(ua\)/,
-      'only social preview bots may receive the variant root stub',
-    );
-    assert.doesNotMatch(middlewareSource, /AI_CRAWLER_UA|AI_CRAWLER_VARIANT_LINKS/);
-  });
-
   it('redirects legacy root map-state deep links to /dashboard before welcome routing', () => {
     assert.match(
       middlewareSource,
@@ -1224,10 +1329,25 @@ describe('welcome landing page routing', () => {
       /dashboardUrl\.pathname = '\/dashboard'/,
       'middleware must move legacy dashboard-state root links to /dashboard',
     );
+    // Hand-built rather than Response.redirect() so the response can carry
+    // Vary (#7660). The same URL now yields two different Locations depending
+    // on the User-Agent, and a 308 is cacheable by default (RFC 9110
+    // §15.4.9) — an unkeyed cache would replay one branch's Location to the
+    // other's client.
     assert.match(
       middlewareSource,
+      /headers: uaConditionedRedirectHeaders\(dashboardUrl\)/,
+      'the legacy root redirect must preserve the query string AND declare the User-Agent cache key',
+    );
+    assert.match(
+      middlewareSource,
+      /'CDN-Cache-Control': 'no-store',\n\s*'Vercel-CDN-Cache-Control': 'no-store',/,
+      'Cache-Control alone loses to the CDN directives on the / route',
+    );
+    assert.doesNotMatch(
+      middlewareSource,
       /Response\.redirect\(dashboardUrl\.toString\(\), 308\)/,
-      'middleware must redirect, preserving the original query string',
+      'Response.redirect() cannot set Vary, so it cannot be used for a UA-conditioned redirect',
     );
   });
 
@@ -1352,20 +1472,20 @@ describe('welcome landing page routing', () => {
   });
 
   it('sitemap lists dashboard routes and does not list legacy /welcome', () => {
-    const sitemap = readFileSync(resolve(__dirname, '../public/sitemap.xml'), 'utf-8');
+    const sitemap = readFileSync(resolve(__dirname, '../public/sitemap-main.xml'), 'utf-8');
     assert.ok(
       sitemap.includes('<loc>https://www.worldmonitor.app/dashboard</loc>'),
-      'public/sitemap.xml must list https://www.worldmonitor.app/dashboard'
+      'public/sitemap-main.xml must list https://www.worldmonitor.app/dashboard'
     );
     for (const host of ['tech', 'finance', 'commodity', 'happy', 'energy']) {
       assert.ok(
         sitemap.includes(`<loc>https://${host}.worldmonitor.app/dashboard</loc>`),
-        `public/sitemap.xml must list https://${host}.worldmonitor.app/dashboard`
+        `public/sitemap-main.xml must list https://${host}.worldmonitor.app/dashboard`
       );
     }
     assert.ok(
       !sitemap.includes('<loc>https://www.worldmonitor.app/welcome</loc>'),
-      'public/sitemap.xml must not list legacy https://www.worldmonitor.app/welcome'
+      'public/sitemap-main.xml must not list legacy https://www.worldmonitor.app/welcome'
     );
   });
 
@@ -1548,7 +1668,11 @@ describe('welcome landing page routing', () => {
     // when the rule it exists to protect is deleted outright.
     for (const required of [
       'main a[data-umami-event-target="welcome-hero"]',
-      'main a[href*="moments"]',
+      // Exact, not `[href*="moments"]`: since #7608 `main` also carries headline
+      // anchors whose href is a third-party article URL, and a substring match
+      // would paint any story slug containing "moments" as a hero CTA until the
+      // deferred stylesheet lands.
+      'main a[href="#moments"]',
       'nav[data-wm-nav] a[aria-label*="Launch"]',
     ]) {
       assert.ok(scanned.has(required), `critical CSS must still style the welcome CTA via ${required}`);
@@ -2068,7 +2192,7 @@ describe('security header guardrails', () => {
     const script = packageJson.scripts?.['test:e2e:webmcp'] ?? '';
     const productionScript = packageJson.scripts?.['test:e2e:webmcp:production'] ?? '';
     const variantSmokeJob = testWorkflowSource.match(
-      /\n  variant-smoke-full:\n[\s\S]*?(?=\n  [a-z][a-z0-9-]+:\n|$)/,
+      /\n {2}variant-smoke-pro-webmcp:\n[\s\S]*?(?=\n {2}[a-z][a-z0-9-]+:\n|$)/,
     )?.[0] ?? '';
     assert.match(script, /WM_REQUIRE_WEBMCP=1/);
     assert.match(script, /e2e\/webmcp\.spec\.ts/);
@@ -2558,12 +2682,12 @@ describe('security header guardrails', () => {
     );
     assert.match(
       viteConfigSource,
-      new RegExp(`cspNonce:\\s*STATIC_SCRIPT_NONCE`),
+      /cspNonce:\s*STATIC_SCRIPT_NONCE/,
       'Vite must stamp emitted HTML entry scripts with the nonce trusted by the header CSP'
     );
     assert.match(
       proViteConfigSource,
-      new RegExp(`cspNonce:\\s*STATIC_SCRIPT_NONCE`),
+      /cspNonce:\s*STATIC_SCRIPT_NONCE/,
       'Pro Vite builds must stamp emitted HTML entry scripts with the nonce trusted by the header CSP'
     );
 
@@ -2845,7 +2969,7 @@ describe('embeddable map route guardrails', () => {
     assert.match(nginxTemplate, /location = \/embed\.js \{[\s\S]*?Access-Control-Allow-Origin "\*"/);
     assert.match(dockerNginxSource, /location = \/embed\.js \{[\s\S]*?Access-Control-Allow-Origin "\*"/);
     assert.doesNotMatch(
-      dockerNginxSource.match(/location = \/embed\.js \{[\s\S]*?\n    \}/)?.[0] ?? '',
+      dockerNginxSource.match(/location = \/embed\.js \{[\s\S]*?\n {4}\}/)?.[0] ?? '',
       /frame-ancestors/,
     );
   });
@@ -2885,8 +3009,8 @@ describe('self-hosted docker nginx SPA entry', () => {
     //   docker/Dockerfile -> docker/nginx.conf.template (published ghcr image)
     for (const conf of ['docker/nginx.conf', 'docker/nginx.conf.template']) {
       const src = readFileSync(resolve(__dirname, `../${conf}`), 'utf-8');
-      assert.match(src, /^\s*index dashboard\.html;/m, `${conf}: index directive must be dashboard.html`);
-      assert.match(src, /try_files \$uri \$uri\/ \/dashboard\.html;/, `${conf}: SPA fallback must serve /dashboard.html`);
+      assert.match(src, /^\s*index dashboard\.html index\.html;/m, `${conf}: index directive must prefer dashboard.html then serve corpus index.html`);
+      assert.match(src, /try_files \$uri \$uri\/ \$uri\/index\.html \/dashboard\.html;/, `${conf}: SPA fallback must serve corpus index.html before /dashboard.html`);
       assert.doesNotMatch(src, /try_files \$uri \$uri\/ \/index\.html;/, `${conf}: must not keep the broken /index.html SPA fallback`);
     }
   });
@@ -3082,16 +3206,18 @@ describe('agent readiness: api-catalog + openapi build', () => {
     const meta = apiEntry['service-meta'];
     assert.ok(Array.isArray(meta) && meta.length > 0, 'api context must carry service-meta entries');
     const hrefs = meta.map((entry) => entry.href);
-    assert.ok(hrefs.includes('https://worldmonitor.app/pricing.md'), 'service-meta must advertise pricing.md');
+    // www, not apex: neither path is on the Cloudflare apex-exemption list, so
+    // the apex form is a 301 an agent pays for before reaching the file (#7660).
+    assert.ok(hrefs.includes('https://www.worldmonitor.app/pricing.md'), 'service-meta must advertise pricing.md');
     assert.ok(
       hrefs.includes('https://www.worldmonitor.app/api/product-catalog'),
       'service-meta must advertise the live product-catalog JSON endpoint'
     );
-    assert.ok(hrefs.includes('https://worldmonitor.app/support.md'), 'service-meta must advertise support.md');
-    assert.ok(hrefs.includes('https://worldmonitor.app/agents.md'), 'service-meta must advertise agents.md (#4952)');
-    assert.ok(hrefs.includes('https://worldmonitor.app/world-monitor.md'), 'service-meta must advertise world-monitor.md');
-    assert.ok(hrefs.includes('https://worldmonitor.app/api-versioning.md'), 'service-meta must advertise api-versioning.md');
-    assert.ok(hrefs.includes('https://worldmonitor.app/plugin.json'), 'service-meta must advertise /plugin.json');
+    assert.ok(hrefs.includes('https://www.worldmonitor.app/support.md'), 'service-meta must advertise support.md');
+    assert.ok(hrefs.includes('https://www.worldmonitor.app/agents.md'), 'service-meta must advertise agents.md (#4952)');
+    assert.ok(hrefs.includes('https://www.worldmonitor.app/world-monitor.md'), 'service-meta must advertise world-monitor.md');
+    assert.ok(hrefs.includes('https://www.worldmonitor.app/api-versioning.md'), 'service-meta must advertise api-versioning.md');
+    assert.ok(hrefs.includes('https://www.worldmonitor.app/plugin.json'), 'service-meta must advertise /plugin.json');
     // The Commerce spec lives outside the root openapi bundle (size budget,
     // #4853) — without this link no advertised descriptor reaches it
     // (post-#4867 review finding); Mintlify serves the raw YAML at this URL.
@@ -3210,9 +3336,8 @@ describe('agent readiness: api-catalog + openapi build', () => {
         script.includes('npm run build:openapi'),
         `scripts["${buildName}"] must chain "npm run build:openapi" so the web bundle ships the spec; got: ${script}`
       );
-      assert.equal(
-        pkg.scripts[prebuildName],
-        'npm run product:facts',
+      assert.ok(
+        pkg.scripts[prebuildName]?.split(' && ').includes('npm run product:facts'),
         `scripts["${prebuildName}"] must regenerate ignored inventory facts before ${buildName}`,
       );
     }
@@ -3483,6 +3608,15 @@ describe('agent readiness: MCP/OAuth origin alignment', () => {
 describe('agent readiness: auth.md walkthrough', () => {
   const authMd = readFileSync(resolve(__dirname, '../public/auth.md'), 'utf-8');
 
+  it('opens with its title and describes API key and OAuth authentication', () => {
+    assert.match(
+      authMd,
+      /^# WorldMonitor — Agent Authentication \(auth\.md\)\n/,
+      'auth.md must open directly with its H1 for scanner compatibility'
+    );
+    assert.match(authMd, /API keys?.*OAuth|OAuth.*API keys?/i);
+  });
+
   it('publishes /auth.md with the WorkOS-prescribed sections', () => {
     for (const heading of ['Discover', 'Pick a method', 'Register', 'Claim', 'Use the credential', 'Errors', 'Revocation']) {
       assert.match(
@@ -3624,6 +3758,30 @@ describe('agent readiness: generic markdown URL-fallback rewrite', () => {
     assert.equal(sourceToRegExp(SPA_HTML_CACHE_SOURCE).test('/dashboard.md'), false);
     assert.equal(sourceToRegExp(SPA_HTML_CACHE_SOURCE).test('/dashboard'), true);
   });
+
+  it('never declares a static canonical over the unbounded generated .md space', () => {
+    // The curated twins (pricing.md, developers.md, …) are standalone documents
+    // with no HTML sibling, so their literal self-canonical header rules are
+    // correct. The generated space is unbounded — /countries/iran.md and an
+    // invented /countries/does-not-exist-xyz.md both land on /api/md-twin — so a
+    // canonical rule that reached them would mint a self-canonical soft-404 that
+    // no handler change can retract (#7860). Only the handler may set a
+    // canonical there, and it points at the sibling HTML page.
+    const generatedTwins = ['/countries/iran.md', '/countries/does-not-exist-xyz.md', '/stocks/AAPL.md'];
+    for (const rule of vercelConfig.headers ?? []) {
+      const declaresCanonical = (rule.headers ?? []).some(
+        (h) => h.key?.toLowerCase() === 'link' && /rel="?canonical"?/.test(h.value ?? ''),
+      );
+      if (!declaresCanonical) continue;
+      for (const path of generatedTwins) {
+        assert.equal(
+          sourceToRegExp(rule.source).test(path),
+          false,
+          `header rule "${rule.source}" declares a canonical over generated twin ${path}`,
+        );
+      }
+    }
+  });
 });
 
 describe('agent readiness: remaining markdown twins', () => {
@@ -3706,17 +3864,19 @@ describe('vercel.json functions config (none expected after carousel moved to ed
 // status) or the full IANA URI form (RFC 9728 OAuth rels). The MCP
 // card rel carries anchor="/mcp" because the server card describes
 // the /mcp endpoint, not the document URL being fetched.
-describe('agent readiness: homepage Link headers', () => {
+describe('agent readiness: public document Link headers', () => {
   const vercel = JSON.parse(readFileSync(resolve(__dirname, '../vercel.json'), 'utf-8'));
 
-  for (const source of ['/', '/dashboard', '/dashboard.html']) {
+  it('keeps discovery headers off blog and pro asset routes', () => {
+    for (const path of ['/blog/_astro/main.js', '/blog/og/post.png', '/blog/images/post.jpg', '/pro/assets/main.js']) {
+      assert.equal(effectiveHeader(path, 'Link'), null, path);
+    }
+  });
+
+  for (const source of ['/', '/dashboard', '/dashboard.html', '/blog', '/blog/', '/blog/glossary/ais/', '/blog/example/', '/pro', '/pro/']) {
     it(`${source} emits a Link header`, () => {
-      const entry = vercel.headers.find((h) =>
-        h.source === source && h.headers.some((header) => header.key === 'Link')
-      );
-      assert.ok(entry, `expected a headers entry for ${source}`);
-      const linkHeader = entry.headers.find((h) => h.key === 'Link');
-      assert.ok(linkHeader, `expected a Link header on ${source}`);
+      const linkHeader = { value: effectiveHeader(source, 'Link') };
+      assert.ok(linkHeader.value, `expected a Link header on ${source}`);
 
       // Must advertise each required rel at least once
       const requiredRels = [
@@ -3906,71 +4066,45 @@ describe('agent readiness: Content-Signal declarations', () => {
   });
 });
 
-// #4952 — three-tier AI crawler policy. A named `User-agent` group REPLACES
-// the `*` group for that crawler (robots.txt groups do not inherit), so the
-// AI search/assistant allow-group must restate the full `*` rule set or those
-// crawlers would lose the /api/ protections. The training-only group must
-// stay a hard `Disallow: /`.
+// #4952 — a named `User-agent` group replaces the `*` group for that crawler.
+// Autonomous search crawlers restate the full `*` rule set. User-triggered
+// fetchers keep the bounded path protections but can open shared map links.
+// The training-only group stays a hard `Disallow: /`.
 describe('agent readiness: robots.txt AI crawler policy', () => {
   const robotsSource = readFileSync(resolve(__dirname, '../public/robots.www.txt'), 'utf-8');
 
-  // Minimal robots.txt group parser: consecutive User-agent lines share one
-  // group; a blank line or a User-agent line following rules starts a new one;
-  // comments never end a group.
-  const parseGroups = (source) => {
-    const groups = [];
-    let current = null;
-    for (const raw of source.split('\n')) {
-      const line = raw.trim();
-      if (line === '') {
-        current = null;
-        continue;
-      }
-      if (line.startsWith('#')) continue;
-      const colon = line.indexOf(':');
-      if (colon === -1) continue;
-      const key = line.slice(0, colon).trim().toLowerCase();
-      const value = line.slice(colon + 1).trim();
-      if (key === 'user-agent') {
-        if (!current || current.rules.length > 0) {
-          current = { agents: [], rules: [] };
-          groups.push(current);
-        }
-        current.agents.push(value.toLowerCase());
-      } else if (current && (key === 'allow' || key === 'disallow')) {
-        current.rules.push(`${key}: ${value}`);
-      }
-    }
-    return groups;
-  };
-
-  const groups = parseGroups(robotsSource);
+  const groups = parseRobotsGroups(robotsSource);
   const starGroup = groups.find((g) => g.agents.includes('*'));
   const aiAllowGroup = groups.find((g) => g.agents.includes('gptbot'));
+  const userFetchGroup = groups.find((g) => g.agents.includes('chatgpt-user'));
   const trainingBlockGroup = groups.find((g) => g.agents.includes('ccbot'));
 
-  // The agents AEO scanners score by name (search/assistant tier).
   const REQUIRED_AI_SEARCH_AGENTS = [
     'gptbot',
     'claudebot',
-    'chatgpt-user',
     'perplexitybot',
     'google-extended',
     'applebot-extended',
   ];
+  const REQUIRED_USER_FETCH_AGENTS = [
+    'chatgpt-user',
+    'claude-user',
+    'perplexity-user',
+    'mistralai-user',
+  ];
   const BLOCKED_TRAINING_AGENTS = ['ccbot', 'bytespider', 'anthropic-ai'];
 
-  it('explicitly allows the AI search/assistant agents in one named group', () => {
-    assert.ok(aiAllowGroup, 'robots.txt must have a named AI search/assistant group (GPTBot et al.)');
+  it('explicitly allows the AI search crawlers in one named group', () => {
+    assert.ok(aiAllowGroup, 'robots.txt must have a named AI search group (GPTBot et al.)');
     for (const agent of REQUIRED_AI_SEARCH_AGENTS) {
       assert.ok(
         aiAllowGroup.agents.includes(agent),
-        `AI search/assistant group must include User-agent: ${agent}`
+        `AI search group must include User-agent: ${agent}`
       );
     }
     assert.ok(
       aiAllowGroup.rules.includes('allow: /'),
-      'AI search/assistant group must Allow: /'
+      'AI search group must Allow: /'
     );
   });
 
@@ -3981,6 +4115,15 @@ describe('agent readiness: robots.txt AI crawler policy', () => {
       [...starGroup.rules].sort(),
       'the AI allow-group must restate the exact `*` rule set — named groups do not inherit, so a drift here silently opens /api/ (or blocks paths) for AI crawlers'
     );
+  });
+
+  it('keeps user-triggered fetchers in their own crawl-permitting group', () => {
+    assert.ok(userFetchGroup, 'robots.txt must have a user-triggered assistant group');
+    for (const agent of REQUIRED_USER_FETCH_AGENTS) {
+      assert.ok(userFetchGroup.agents.includes(agent), `user fetch group must include User-agent: ${agent}`);
+      assert.ok(!aiAllowGroup.agents.includes(agent), `${agent} must not inherit autonomous crawl limits`);
+    }
+    assert.ok(userFetchGroup.rules.includes('allow: /'), 'user fetch group must Allow: /');
   });
 
   it('disallows the bulk training-only scrapers entirely', () => {
@@ -3999,7 +4142,7 @@ describe('agent readiness: robots.txt AI crawler policy', () => {
   });
 
   it('never lists an allowed AI agent in the blocked group (and vice versa)', () => {
-    for (const agent of REQUIRED_AI_SEARCH_AGENTS) {
+    for (const agent of [...REQUIRED_AI_SEARCH_AGENTS, ...REQUIRED_USER_FETCH_AGENTS]) {
       assert.ok(
         !trainingBlockGroup.agents.includes(agent),
         `${agent} drives citations and must not be in the blocked group`
@@ -4022,6 +4165,410 @@ describe('agent readiness: robots.txt AI crawler policy', () => {
         );
       }
     }
+  });
+});
+
+// #7660: autonomous crawl groups block unbounded coordinate state and /tmp/
+// paths. User-triggered fetchers can follow shared map links.
+describe('agent readiness: crawl-budget disallows (#7660)', () => {
+  const CRAWL_BUDGET_DISALLOWS = [
+    'disallow: /tmp/',
+    'disallow: /*?*lat=',
+    'disallow: /*?*lon=',
+    'disallow: /*?*zoom=',
+  ];
+
+  // The inverse half of the contract, and the more important one. robots.txt is
+  // a crawl control, not a canonicalization tool: a disallowed URL is never
+  // fetched, so Google reads neither its rel=canonical nor its redirect. These
+  // families already consolidate — middleware 308s a crawler off ref/
+  // wm_referral/utm_* (a 308 passes the link equity that affiliates' pasted
+  // /pro?ref=… URLs carry), and wm_content_* answers 200 with a canonical.
+  // Blocking them would replace a working mechanism with a worse one.
+  const MUST_STAY_CRAWLABLE = [
+    'disallow: /*?*ref=',
+    'disallow: /*?*wm_referral=',
+    'disallow: /*?*wm_content_',
+    'disallow: /*?*utm_',
+    // `layers` looks like map state but is not what makes the space unbounded.
+    // src/utils/urlState.ts sets `zoom` unconditionally on every share URL, so
+    // `/*?*zoom=` already catches the whole family; `layers` added no coverage
+    // and disallowed the bounded dashboard CTAs build-use-cases.mjs publishes
+    // with layers and no coordinates (PR #7689 review).
+    'disallow: /*?*layers=',
+  ];
+
+  for (const file of ['robots.www.txt', 'robots.variant.txt']) {
+    it(`${file} lets user-triggered assistant fetchers open shared map links`, () => {
+      const groups = parseRobotsGroups(readFileSync(resolve(__dirname, `../public/${file}`), 'utf-8'));
+      const starGroup = groups.find((group) => group.agents.includes('*'));
+      const userFetchGroup = groups.find((group) => group.agents.includes('chatgpt-user'));
+      assert.ok(starGroup, `${file} must have a default group`);
+      assert.ok(userFetchGroup, `${file} must have a user-triggered assistant group`);
+      for (const agent of ['chatgpt-user', 'claude-user', 'perplexity-user', 'mistralai-user']) {
+        assert.ok(userFetchGroup.agents.includes(agent), `${file} must include ${agent}`);
+      }
+      const coordinateRules = new Set(CRAWL_BUDGET_DISALLOWS.slice(1));
+      const expectedRules = starGroup.rules.filter((rule) => !coordinateRules.has(rule));
+      assert.deepStrictEqual(
+        [...userFetchGroup.rules].sort(),
+        [...expectedRules].sort(),
+        `${file} user-triggered fetchers must omit only the coordinate rules`
+      );
+    });
+
+    it(`${file} carries every crawl-budget disallow in every autonomous crawl group`, () => {
+      const groups = parseRobotsGroups(readFileSync(resolve(__dirname, `../public/${file}`), 'utf-8'));
+      const crawling = groups.filter((g) => g.rules.includes('allow: /'));
+      const autonomous = crawling.filter((g) => !g.agents.includes('chatgpt-user'));
+      assert.ok(autonomous.length >= 2, `${file} must have a * group and a named AI group that crawl`);
+      for (const group of autonomous) {
+        for (const rule of CRAWL_BUDGET_DISALLOWS) {
+          assert.ok(
+            group.rules.includes(rule),
+            `${file} group [${group.agents.join(', ')}] is missing \`${rule.replace('disallow:', 'Disallow:')}\` — ` +
+              'robots groups do not inherit, so this crawler still burns budget on the space the others no longer crawl'
+          );
+        }
+      }
+      for (const group of crawling) {
+        for (const rule of MUST_STAY_CRAWLABLE) {
+          assert.ok(
+            !group.rules.includes(rule),
+            `${file} group [${group.agents.join(', ')}] added \`${rule.replace('disallow:', 'Disallow:')}\` — ` +
+              'that family already consolidates via a 308 or a rel=canonical, and a disallowed URL is never ' +
+              'fetched, so blocking it strands the signal instead of folding it'
+          );
+        }
+      }
+    });
+  }
+
+  it('leaves the canonical param-free documents crawlable', () => {
+    // The disallows are query-scoped on purpose: `/dashboard` and `/pro` are
+    // the consolidation targets the canonicals point at, so blocking the bare
+    // paths would delete the pages this change exists to protect.
+    for (const file of ['robots.www.txt', 'robots.variant.txt']) {
+      const body = readFileSync(resolve(__dirname, `../public/${file}`), 'utf-8');
+      assert.doesNotMatch(body, /^Disallow: \/dashboard$/m, `${file} must keep /dashboard crawlable`);
+      assert.doesNotMatch(body, /^Disallow: \/docs$/m, `${file} must keep /docs crawlable`);
+      for (const line of body.split('\n')) {
+        const match = /^Disallow: (\/\*.*)$/.exec(line.trim());
+        if (!match) continue;
+        assert.match(
+          match[1],
+          /^\/\*\?\*/,
+          `${line.trim()} must be query-scoped (\`/*?*\`) — a bare wildcard would block the canonical document too`
+        );
+      }
+    }
+  });
+
+  // Rule presence is not the contract — what the rules MATCH is. This resolves
+  // real request paths against the `*` group using Google's documented
+  // semantics (`*` = any sequence, `$` = end of URL, longest match wins,
+  // Allow beats an equal-length Disallow) so a future edit that quietly
+  // narrows or widens a pattern fails here rather than in Search Console.
+  describe('resolved against the paths Search Console actually reported', () => {
+    const escapeRe = (part) => part.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    // Google's robots.txt path matching: `*` is any sequence, a trailing `$`
+    // anchors the end of the URL (query string included), everything else is
+    // a literal prefix match.
+    const pathMatches = (pattern, path) => {
+      const source = pattern.endsWith('$')
+        ? `^${pattern.slice(0, -1).split('*').map(escapeRe).join('.*')}$`
+        : `^${pattern.split('*').map(escapeRe).join('.*')}`;
+      return new RegExp(source).test(path);
+    };
+
+    const ruleCache = new Map();
+    const starGroupRules = (file) => {
+      if (!ruleCache.has(file)) {
+        const groups = parseRobotsGroups(readFileSync(resolve(__dirname, `../public/${file}`), 'utf-8'));
+        const star = groups.find((g) => g.agents.includes('*'));
+        assert.ok(star, `${file} must have a * group`);
+        ruleCache.set(
+          file,
+          star.rules.map((rule) => {
+            const [key, ...rest] = rule.split(': ');
+            return { allow: key === 'allow', pattern: rest.join(': ') };
+          })
+        );
+      }
+      return ruleCache.get(file);
+    };
+
+    const isCrawlable = (file, path) => {
+      let best = null;
+      for (const rule of starGroupRules(file)) {
+        if (!pathMatches(rule.pattern, path)) continue;
+        if (!best || rule.pattern.length > best.pattern.length) best = rule;
+        else if (rule.pattern.length === best.pattern.length && rule.allow) best = rule;
+      }
+      return best ? best.allow : true;
+    };
+
+    // Verbatim shapes from the 2026-09-04 GSC "Page with redirect" and
+    // "Not found (404)" exports.
+    const BLOCKED = [
+      '/?lat=20.0000&lon=0.0000&zoom=1.00&view=global&timeRange=7d&layers=conflicts,bases',
+      '/index?lat=NaN&lon=NaN&zoom=2.50&view=america&timeRange=7d&layers=conflicts',
+      '/dashboard?lat=20.0000&lon=0.0000&zoom=1.00',
+      '/tmp/gem-pipelines.json',
+    ];
+    const CRAWLABLE = [
+      '/',
+      '/dashboard',
+      '/pro',
+      '/countries/iran/',
+      '/compare/iran-vs-israel/',
+      '/docs/mcp-overview',
+      // #7660 proposed Disallow: /docs/_next/ for the 139 stale hashed chunks
+      // that 404 after every Mintlify redeploy. Measured instead: a live
+      // /docs/* page pulls 76 assets from that prefix, JS and CSS both, and
+      // the current deploy's assets carry the same `?dpl=` pin as the stale
+      // ones — no pattern separates them. Blocking it would hide every render
+      // resource from Googlebot on the pages already stuck in "crawled -
+      // currently not indexed", which costs more than a cheap 404.
+      '/docs/_next/static/chunks/462bacc63bed9960.css?dpl=dpl_6TpKozpvfbf2eKSzPrrzWSvEC9fx',
+      // docs/embed-live-map.mdx documents this exact iframe src. The map-param
+      // rules would otherwise stop Googlebot fetching our widget while it
+      // renders a partner's page.
+      '/embed?layers=conflicts,earthquakes,weather&center=20,0&zoom=1&theme=dark&variant=full',
+      '/embed?panel=fear-greed&theme=dark',
+      // Bounded, already-consolidating families: the middleware 308 and the
+      // rel=canonical only work if the crawler is allowed to fetch them.
+      '/pro?ref=affiliate',
+      '/pro?wm_referral=abc123',
+      '/pro?wm_content_source=use-cases&wm_content_medium=internal',
+      '/countries/iran/?utm_source=newsletter',
+      '/blog/',
+      '/api/llms.txt',
+    ];
+
+    for (const file of ['robots.www.txt', 'robots.variant.txt']) {
+      it(`${file} blocks the reported crawl-waste URLs`, () => {
+        for (const path of BLOCKED) {
+          assert.equal(isCrawlable(file, path), false, `${file} must block ${path}`);
+        }
+      });
+
+      it(`${file} still allows the canonical corpus`, () => {
+        for (const path of CRAWLABLE) {
+          // /pro and its query forms are deliberately Disallowed on variant
+          // hosts (#6835) — /pro/welcome.html stays 200 there.
+          if (file === 'robots.variant.txt' && path.startsWith('/pro')) continue;
+          assert.equal(isCrawlable(file, path), true, `${file} must keep ${path} crawlable`);
+        }
+      });
+    }
+
+    // Probed against production 2026-09-04: Vercel applies vercel.json
+    // `redirects` BEFORE middleware. On a variant host, `/?ref=x` answers
+    // 308 -> `/dashboard?ref=x` with the param intact, while the same request
+    // on www answers 308 -> `/` with it stripped — so the middleware never
+    // runs for `/` there, and crawlerCanonicalUrl() cannot collapse variant
+    // map-state URLs.
+    //
+    // That makes the variant robots rules load-bearing rather than
+    // belt-and-braces: they are the ONLY thing keeping a compliant crawler off
+    // the variant hosts' share of the space (415 of the 1,000 exported
+    // redirect URLs). If the `/` -> `/dashboard` host redirect is ever
+    // removed, middleware takes over and this coupling changes — so assert the
+    // pair together rather than leaving the dependency unwritten.
+    it('keeps the variant map-state rules load-bearing while the / host redirect exists', () => {
+      const variantRootRedirect = vercelConfig.redirects.find(
+        (r) =>
+          r.source === '/' &&
+          Array.isArray(r.has) &&
+          r.has.some((h) => h.type === 'host' && /tech|finance|commodity|happy|energy/.test(h.value))
+      );
+      if (!variantRootRedirect) return;
+      assert.equal(variantRootRedirect.destination, '/dashboard');
+      for (const path of [
+        '/?lat=20.0000&lon=0.0000&zoom=1.00',
+        '/dashboard?lat=20.0000&lon=0.0000&zoom=1.00',
+      ]) {
+        assert.equal(
+          isCrawlable('robots.variant.txt', path),
+          false,
+          `robots.variant.txt must block ${path} itself — the middleware collapse never runs on a variant host`
+        );
+      }
+    });
+
+    // The sitemap covers the documents we declare. This covers the links those
+    // documents CONTAIN — a different failure, and the one a crawl-budget rule
+    // is most likely to cause: publishing a link on ~240 generated pages while
+    // telling Google it may not follow it. Blocking a link you keep emitting is
+    // the worst of both, and it moves the volume into "Blocked by robots.txt"
+    // rather than removing it.
+    //
+    // Shapes are the ones the corpus builders actually emit
+    // (scripts/build-crawlable-corpus.mjs withUtmSource, scripts/build-use-cases.mjs
+    // content attribution, scripts/crawlable-sources-page.mjs,
+    // scripts/build-research-reports.mjs).
+    // `/*?*lat=` is a substring match over the whole query, not a parameter-NAME
+    // match: it also catches any param ending in the token (`?colon=` matches
+    // `/*?*lon=`) and value-side text (`?q=flat=earth` matches `/*?*lat=`).
+    //
+    // That cannot be fixed in robots.txt. Name-anchoring needs `/*&lat=` for a
+    // non-first parameter, and a literal `&` in a rule path never matches —
+    // verified against Protego, which implements Google's spec: `/*&lat=` does
+    // not match `/d?view=g&lat=1` while `/*?*lat=` does. Anchoring would have
+    // silently stopped blocking every map URL whose lat is not the first param.
+    //
+    // So the exposure is real and permanent, and the guard is on the other
+    // side: no parameter this application actually reads may end in one of the
+    // blocked tokens. 96 params read via searchParams today, zero collisions —
+    // this fails the day someone adds `?colon=`, `?salon=`, `?pylon=` or
+    // `?flat=`, which is when it matters.
+    it('has no live collision between a blocked token and a real parameter', () => {
+      const BLOCKED_TOKENS = ['lat', 'lon', 'zoom', 'layers'];
+      const SOURCE_DIRS = ['src', 'server', 'api', 'scripts', 'shared'];
+      // Both spellings: `url.searchParams.get('x')` and the bare
+      // `params.get('x')` / `params.set('x', …)` used once a URLSearchParams is
+      // in a local (src/utils/urlState.ts reads zoom and layers that way).
+      const PARAM_RE = /(?:searchParams|params)\.(?:get|has|set)\(\s*['"]([A-Za-z0-9_]+)['"]/g;
+
+      const collectParams = (dir, acc) => {
+        for (const entry of readdirSync(dir, { withFileTypes: true })) {
+          if (entry.name === 'node_modules' || entry.name.startsWith('.')) continue;
+          const full = join(dir, entry.name);
+          if (entry.isDirectory()) {
+            collectParams(full, acc);
+            continue;
+          }
+          if (!/\.(ts|tsx|mts|mjs|js|cjs)$/.test(entry.name)) continue;
+          for (const m of readFileSync(full, 'utf-8').matchAll(PARAM_RE)) acc.add(m[1]);
+        }
+        return acc;
+      };
+
+      const params = new Set();
+      for (const dir of SOURCE_DIRS) collectParams(resolve(__dirname, '..', dir), params);
+      assert.ok(params.size > 50, `expected to find the app's query params, got ${params.size}`);
+      for (const token of BLOCKED_TOKENS) assert.ok(params.has(token), `${token} must be a real param`);
+
+      // The bounding-box params collide on the token but never on a crawlable
+      // URL: they exist only on `/api/*` RPC routes, which `Disallow: /api/`
+      // has covered since long before these rules. Allowlisted explicitly, and
+      // re-proved below, so a NEW collision on a crawlable surface still fails.
+      const API_ONLY_COLLISIONS = ['sw_lat', 'sw_lon', 'ne_lat', 'ne_lon'];
+
+      const collisions = [...params].filter(
+        (name) => !BLOCKED_TOKENS.includes(name) && BLOCKED_TOKENS.some((t) => name.endsWith(t))
+      );
+      assert.deepEqual(
+        collisions.filter((name) => !API_ONLY_COLLISIONS.includes(name)).sort(),
+        [],
+        'these parameters end in a blocked token, so `/*?*<token>=` would disallow every URL ' +
+          `carrying them: ${collisions.join(', ')}. Rename the param, or drop the rule.`
+      );
+
+      // The allowlist cannot rot: every file that names one of these must also
+      // name an /api/ path, so the day one is used on a crawlable URL this
+      // fails instead of quietly widening the exemption.
+      const filesNaming = (needle, dir, acc = []) => {
+        for (const entry of readdirSync(dir, { withFileTypes: true })) {
+          if (entry.name === 'node_modules' || entry.name.startsWith('.')) continue;
+          const full = join(dir, entry.name);
+          if (entry.isDirectory()) {
+            filesNaming(needle, full, acc);
+            continue;
+          }
+          if (!/\.(ts|tsx|mts|mjs|js|cjs)$/.test(entry.name)) continue;
+          const body = readFileSync(full, 'utf-8');
+          // As a query KEY only — quoted, or written into a query string. A
+          // bare prose mention (`// [sw_lat, sw_lon, …]` documenting an array
+          // order) is not a parameter and must not trip this.
+          const asQueryKey = new RegExp(`['"\`]${needle}['"\`]|[?&]${needle}=`);
+          if (asQueryKey.test(body)) acc.push({ path: full, apiScoped: body.includes('/api/') });
+        }
+        return acc;
+      };
+      for (const name of API_ONLY_COLLISIONS) {
+        for (const dir of SOURCE_DIRS) {
+          for (const hit of filesNaming(name, resolve(__dirname, '..', dir))) {
+            assert.ok(
+              hit.apiScoped,
+              `${name} is allowlisted as /api/-only, but ${relative(resolve(__dirname, '..'), hit.path)} ` +
+                'names it without any /api/ path — if it now reaches a crawlable URL, `/*?*lat=` disallows that URL'
+            );
+          }
+        }
+      }
+    });
+
+    it('never blocks a link shape our own build emits', () => {
+      // Read the hrefs out of the builders rather than sampling them by hand.
+      // The hand-written sample was the bug: it listed twelve shapes and missed
+      // the two `layers=` dashboard CTAs in build-use-cases.mjs, so the rules
+      // shipped blocking links the site publishes (PR #7689 review).
+      const BUILDERS = [
+        'scripts/build-crawlable-corpus.mjs',
+        'scripts/build-use-cases.mjs',
+        'scripts/crawlable-sources-page.mjs',
+        'scripts/build-research-reports.mjs',
+      ];
+      // A quoted or backticked literal that starts with `/` and has a query.
+      const HREF_RE = /['"`](\/[A-Za-z0-9._\-/${}]*\?[^'"`]*)['"`]/g;
+
+      const emitted = new Map();
+      for (const builder of BUILDERS) {
+        const src = readFileSync(resolve(__dirname, '..', builder), 'utf-8');
+        src.split('\n').forEach((line, index) => {
+          for (const match of line.matchAll(HREF_RE)) {
+            const raw = match[1];
+            if (raw.includes('://')) continue;
+            // Template interpolation stands in as a concrete value; the rules
+            // key on parameter names, so the substituted value is irrelevant.
+            emitted.set(raw.replace(/\$\{[^}]*\}/g, 'X'), `${builder}:${index + 1}`);
+          }
+        });
+      }
+
+      assert.ok(
+        emitted.size >= 8,
+        `expected to read the corpus builders' query-bearing hrefs, found ${emitted.size} — ` +
+          'the extraction regex probably stopped matching, which would make this test vacuous'
+      );
+
+      // The attribution wrappers every builder applies on top of those literals.
+      const TAGGED = (href) =>
+        `${href}${href.includes('?') ? '&' : '?'}wm_content_source=worldmonitor-use-cases&utm_source=seo-use-case`;
+
+      const blocked = [];
+      for (const [href, where] of emitted) {
+        for (const candidate of [href, TAGGED(href)]) {
+          if (!isCrawlable('robots.www.txt', candidate)) blocked.push(`  ${where}  ${candidate}`);
+        }
+      }
+      assert.deepEqual(
+        blocked,
+        [],
+        'robots.www.txt blocks links the build emits on generated pages. Blocking a link you keep ' +
+          'publishing does not remove the crawl volume, it relabels it "Blocked by robots.txt" and ' +
+          `tells Google not to follow your own internal graph:\n${blocked.join('\n')}`
+      );
+    });
+
+    it('blocks nothing we declare in the sitemap', () => {
+      // The failure mode worth guarding: a crawl-budget rule that also deletes
+      // part of the 845-URL declared inventory it exists to protect. Resolved
+      // against every <loc> rather than a sample.
+      const sitemap = readFileSync(resolve(__dirname, '../public/sitemap-main.xml'), 'utf-8');
+      const locs = [...sitemap.matchAll(/<loc>([^<]+)<\/loc>/g)].map((m) => m[1]);
+      assert.ok(locs.length > 100, `expected a populated sitemap, got ${locs.length} entries`);
+      for (const loc of locs) {
+        const { pathname, search } = new URL(loc);
+        assert.equal(
+          isCrawlable('robots.www.txt', `${pathname}${search}`),
+          true,
+          `robots.www.txt blocks a sitemap-declared URL: ${loc}`
+        );
+      }
+    });
   });
 });
 
@@ -4298,11 +4845,11 @@ describe('markdown canonical Link headers (#4999)', () => {
   }
 
   it('every sitemap-listed .md URL has the canonical Link header rule', () => {
-    const sitemap = readFileSync(resolve(__dirname, '../public/sitemap.xml'), 'utf-8');
+    const sitemap = readFileSync(resolve(__dirname, '../public/sitemap-main.xml'), 'utf-8');
     const mdUrls = [...sitemap.matchAll(/<loc>https:\/\/www\.worldmonitor\.app(\/[^<]+\.md)<\/loc>/g)].map((m) => m[1]);
-    assert.ok(mdUrls.length > 0, 'expected .md entries in sitemap.xml');
+    assert.ok(mdUrls.length > 0, 'expected .md entries in sitemap-main.xml');
     for (const path of mdUrls) {
-      assert.ok(MD_PAGES.includes(path), `${path} is in sitemap.xml but has no canonical Link header rule — add it to vercel.json and this test`);
+      assert.ok(MD_PAGES.includes(path), `${path} is in sitemap-main.xml but has no canonical Link header rule — add it to vercel.json and this test`);
     }
   });
 });
@@ -4325,7 +4872,8 @@ describe('agent readiness: named developer-resource pages (#4953)', () => {
   for (const page of DEV_PAGES) {
     it(`public/${page.file} opens with the brand-named H1 "${page.h1}"`, () => {
       const body = readFileSync(resolve(__dirname, `../public/${page.file}`), 'utf-8');
-      assert.ok(body.startsWith(`${page.h1}\n`), `public/${page.file} must open with "${page.h1}"`);
+      const content = body.replace(/^---\n[\s\S]*?\n---\n+/, '');
+      assert.ok(content.startsWith(`${page.h1}\n`), `public/${page.file} must open with "${page.h1}" after metadata`);
     });
 
     it(`${page.path} serves the static page, never the app shell`, () => {
@@ -4359,20 +4907,21 @@ describe('agent readiness: named developer-resource pages (#4953)', () => {
     // web-search discovery surfaces (candidate fixes #1/#3 of the issue) — assert
     // them directly so a dropped sitemap entry or blog cross-link is caught here,
     // not only via the reverse #4999 sitemap->MD_PAGES sweep.
-    const sitemap = readFileSync(resolve(__dirname, '../public/sitemap.xml'), 'utf-8');
+    const sitemap = readFileSync(resolve(__dirname, '../public/sitemap-main.xml'), 'utf-8');
     const blogPost = readFileSync(
       resolve(__dirname, '../blog-site/src/content/blog/build-on-worldmonitor-developer-api-open-source.md'),
       'utf-8'
     );
     for (const page of DEV_PAGES) {
-      const url = `https://worldmonitor.app${page.path}`;
+      // www, not apex (#7660): the developer-resource pages 301 off the apex.
+      const url = `https://www.worldmonitor.app${page.path}`;
       assert.ok(catalogHrefs.includes(url), `api-catalog must advertise ${url}`);
       for (const [name, content] of surfaces) {
         assert.ok(content.includes(page.path), `public/${name} must link ${page.path}`);
       }
       assert.ok(
         sitemap.includes(`https://www.worldmonitor.app${page.path}`),
-        `sitemap.xml must register ${page.path} on the www host`
+        `sitemap-main.xml must register ${page.path} on the www host`
       );
       assert.ok(blogPost.includes(page.path), `the developer blog post must cross-link ${page.path}`);
     }
@@ -4478,9 +5027,9 @@ describe('section-scoped llms.txt files', () => {
   it('the site-wide llms.txt cross-links every section file and the sandbox', () => {
     const llms = readFileSync(resolve(__dirname, '../public/llms.txt'), 'utf-8');
     for (const url of [
-      'https://worldmonitor.app/api/llms.txt',
+      'https://www.worldmonitor.app/api/llms.txt',
       'https://www.worldmonitor.app/docs/llms.txt',
-      'https://worldmonitor.app/developers/llms.txt',
+      'https://www.worldmonitor.app/developers/llms.txt',
       'https://www.worldmonitor.app/blog/llms.txt',
       'https://www.worldmonitor.app/sandbox/index.json',
       'https://www.worldmonitor.app/schemamap.xml',
@@ -4541,6 +5090,7 @@ describe('variant-host canonicalization (#6833–#6836)', () => {
     'country-instability-index',
     'countries',
     'chokepoints',
+    'compare',
     'research',
     'tools',
     'crises',
@@ -4766,8 +5316,14 @@ describe('variant-host canonicalization (#6833–#6836)', () => {
     for (const path of ['/pro', '/api/', '/tests/']) {
       assert.match(body, new RegExp(`^Disallow: ${path.replace('/', '\\/')}$`, 'm'), `variant robots must Disallow ${path}`);
     }
-    assert.match(body, /^Allow: \/dashboard$/m);
-    assert.doesNotMatch(body, /^Disallow: \/dashboard$/m);
+    // End-anchored since #7660. Unanchored, `/dashboard` is 10 characters and
+    // out-ranks the 8-9 character `/*?*lat=`, `/*?*lon=`, `/*?*zoom=`,
+    // `/*?*ref=` and `/*?*utm_` rules, so any map URL omitting `layers` slipped
+    // straight through on the one path that generates the space. `$` keeps the
+    // bare document explicitly crawlable without covering its query forms.
+    assert.match(body, /^Allow: \/dashboard\$$/m);
+    assert.doesNotMatch(body, /^Allow: \/dashboard$/m);
+    assert.doesNotMatch(body, /^Disallow: \/dashboard\$?$/m);
     assert.match(body, /^Sitemap: https:\/\/www\.worldmonitor\.app\/sitemap\.xml$/m);
   });
 
@@ -4820,35 +5376,8 @@ describe('variant-host canonicalization (#6833–#6836)', () => {
   });
 
   it('variant and api robots keep AI-group rule parity with their own * group (#6835)', () => {
-    const parseGroups = (source) => {
-      const groups = [];
-      let current = null;
-      for (const raw of source.split('\n')) {
-        const line = raw.trim();
-        if (line === '') {
-          current = null;
-          continue;
-        }
-        if (line.startsWith('#')) continue;
-        const colon = line.indexOf(':');
-        if (colon === -1) continue;
-        const key = line.slice(0, colon).trim().toLowerCase();
-        const value = line.slice(colon + 1).trim();
-        if (key === 'user-agent') {
-          if (!current || current.rules.length > 0) {
-            current = { agents: [], rules: [] };
-            groups.push(current);
-          }
-          current.agents.push(value.toLowerCase());
-        } else if (current && (key === 'allow' || key === 'disallow')) {
-          current.rules.push(`${key}: ${value}`);
-        }
-      }
-      return groups;
-    };
-
     for (const file of ['robots.variant.txt', 'robots.api.txt']) {
-      const groups = parseGroups(readFileSync(resolve(__dirname, `../public/${file}`), 'utf-8'));
+      const groups = parseRobotsGroups(readFileSync(resolve(__dirname, `../public/${file}`), 'utf-8'));
       const star = groups.find((g) => g.agents.includes('*'));
       const ai = groups.find((g) => g.agents.includes('gptbot'));
       const training = groups.find((g) => g.agents.includes('ccbot'));
@@ -4884,5 +5413,54 @@ describe('variant-host canonicalization (#6833–#6836)', () => {
     assert.ok(SPA_HTML_CACHE_SOURCE.includes('|src|'), 'HTML cache catch-all must exclude /src');
     assert.ok(SPA_HTML_CACHE_SOURCE.includes('|tmp|'), 'HTML cache catch-all must exclude /tmp');
     assert.ok(SPA_HTML_CACHE_SOURCE.includes('|server|'), 'HTML cache catch-all must exclude /server');
+  });
+});
+
+describe('cold-load metric evidence reaches the CI artifact (#7837)', () => {
+  const mapBudgetE2eSource = readFileSync(
+    resolve(__dirname, '../e2e/map-overlay-marker-budget.spec.ts'),
+    'utf-8',
+  );
+
+  // The failure this pins is SILENT. `testInfo.attach({ body })` keeps the
+  // bytes in memory for a reporter to persist, and the `list` reporter this
+  // project runs persists nothing — so the spec passed while its cold-load
+  // metrics never reached the uploaded artifact (shard-1 of run 34144452921
+  // contained zero files for this spec). Nothing goes red when that regresses;
+  // the evidence simply stops existing, which is how #7837's own acceptance
+  // criteria became unanswerable.
+  it('attaches the cold-load metrics by path, never by body', () => {
+    assert.match(mapBudgetE2eSource, /testInfo\.outputPath\('cold-dashboard-metrics\.json'\)/);
+    assert.match(mapBudgetE2eSource, /await writeFile\(path, payload, 'utf8'\)/);
+    assert.match(
+      mapBudgetE2eSource,
+      /testInfo\.attach\('cold-dashboard-metrics\.json', \{ path, contentType: 'application\/json' \}\)/,
+    );
+    assert.doesNotMatch(
+      mapBudgetE2eSource,
+      /attach\('cold-dashboard-metrics\.json', \{[\s\S]{0,80}?body:/,
+      'a body attachment is dropped by the list reporter and never reaches test-results/',
+    );
+    // A path attachment only survives a PASSING test because output is kept.
+    assert.match(playwrightConfigSource, /preserveOutput:\s*'always'/);
+    // ...and test-results/ is what the smoke job uploads.
+    assert.match(testWorkflowSource, /path: test-results\//);
+  });
+
+  // #7848 moved the readiness gate to first paint; #7837 added a settled
+  // sample beside it that is deliberately NOT asserted, because a slow runner
+  // must never redden this required job. Folding the settled sample into the
+  // budget assertion would reintroduce exactly the flake both issues exist to
+  // remove — visibly, but only after a live CI run.
+  it('asserts the dashboard budgets against the first-paint sample only', () => {
+    assert.match(
+      mapBudgetE2eSource,
+      /assertDashboardMetricBudgets\(samples\.map\(\(sample\) => sample\.firstPaint\.postGc\)\)/,
+    );
+    assert.doesNotMatch(
+      mapBudgetE2eSource,
+      /assertDashboardMetricBudgets\(samples\.map\(\(sample\) => sample\.quiescence/,
+      'the settled sample is recorded, never asserted (#7837)',
+    );
   });
 });

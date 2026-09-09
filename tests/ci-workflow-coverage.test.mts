@@ -1,9 +1,12 @@
 import assert from 'node:assert/strict';
-import { execFileSync } from 'node:child_process';
-import { existsSync, readdirSync, readFileSync } from 'node:fs';
+import { execFileSync, spawnSync } from 'node:child_process';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { dirname, resolve } from 'node:path';
 import { describe, it } from 'node:test';
 import { fileURLToPath } from 'node:url';
+import { runInNewContext } from 'node:vm';
+import YAML from 'yaml';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const workflowsDir = resolve(root, '.github/workflows');
@@ -14,6 +17,7 @@ const packageScripts = packageJson.scripts ?? {};
 const read = (p: string) => readFileSync(p, 'utf8').replace(/\r\n/g, '\n');
 
 const deployGateWorkflow = read(resolve(workflowsDir, 'deploy-gate.yml'));
+const deployGateScript = read(resolve(workflowsDir, '../scripts/deploy-gate.sh'));
 const securityAuditWorkflow = read(resolve(workflowsDir, 'security-audit.yml'));
 const securityAuditScript = read(resolve(root, '.github/scripts/audit-production-dependencies.mjs'));
 const testWorkflow = read(resolve(workflowsDir, 'test.yml'));
@@ -22,6 +26,52 @@ const desktopCanaryWorkflow = read(resolve(workflowsDir, 'test-linux-app.yml'));
 const lintCodeWorkflow = read(resolve(workflowsDir, 'lint-code.yml'));
 const protoCheckWorkflow = read(resolve(workflowsDir, 'proto-check.yml'));
 const playwrightConfig = read(resolve(root, 'playwright.config.ts'));
+
+describe('browser-loss artifact capture (#6501, #7880)', () => {
+  for (const exitCode of [0, 17]) {
+    it(`retains logs after output cleanup and preserves smoke exit ${exitCode}`, () => {
+      const workflow = YAML.parse(testWorkflow);
+      const step = workflow.jobs['variant-smoke-shards'].steps.find(
+        (candidate: { name?: string }) => candidate.name === 'Run ci-smoke with browser-loss diagnostics',
+      );
+      assert.ok(step, 'both current smoke shards must run the diagnostic capture');
+      const dir = mkdtempSync(resolve(tmpdir(), 'wm-browser-loss-capture-'));
+      try {
+        mkdirSync(resolve(dir, 'bin'));
+        // Model Playwright opening its debug file before clearing outputDir.
+        // Two workers then emit evidence that must survive the same invocation.
+        writeFileSync(resolve(dir, 'bin/npm'), `#!${process.execPath}
+const fs = require('node:fs');
+if (process.env.DEBUG !== 'pw:browser') process.exit(98);
+const fd = process.env.DEBUG_FILE ? fs.openSync(process.env.DEBUG_FILE, 'w') : 2;
+fs.rmSync('test-results', { recursive: true, force: true });
+fs.mkdirSync('test-results');
+fs.writeFileSync('test-results/trace.zip', 'retained trace');
+fs.writeSync(fd, 'pw:browser [pid=101] <process did exit: exitCode=null, signal=SIGKILL>\\n');
+fs.writeSync(fd, 'pw:browser [pid=102] <process did exit: exitCode=0, signal=null>\\n');
+console.log('smoke completed');
+process.exit(${exitCode});
+`, { mode: 0o755 });
+        writeFileSync(resolve(dir, 'bin/free'), '#!/bin/sh\nprintf "Mem: 16384 2048 14336\\n"\n', { mode: 0o755 });
+        const result = spawnSync('bash', ['-c', step.run.replaceAll('${{ matrix.shard }}', '1')], {
+          cwd: dir,
+          env: { ...process.env, ...step.env, PATH: `${dir}/bin:${process.env.PATH}` },
+          encoding: 'utf8',
+          timeout: 15_000,
+        });
+        assert.equal(result.status, exitCode, result.stderr);
+        const log = read(resolve(dir, 'test-results/browser-loss/playwright.log'));
+        assert.match(log, /pid=101.*signal=SIGKILL/);
+        assert.match(log, /pid=102.*exitCode=0/);
+        assert.match(log, /smoke completed/);
+        assert.match(read(resolve(dir, 'test-results/browser-loss/memory-samples.log')), /Mem: 16384 2048 14336/);
+        assert.equal(read(resolve(dir, 'test-results/trace.zip')), 'retained trace');
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  }
+});
 const workflowText = readdirSync(workflowsDir)
   .filter((name) => name.endsWith('.yml') || name.endsWith('.yaml'))
   .map((name) => read(resolve(workflowsDir, name)))
@@ -31,7 +81,6 @@ const REQUIRED_PR_SCRIPTS = [
   'test:data',
   'test:sidecar',
   'test:convex',
-  'test:e2e:ci-smoke',
   'test:resilience-validation-smoke',
 ] as const;
 
@@ -40,12 +89,18 @@ const REQUIRED_PR_SCRIPTS = [
 // while CI stays green, so the required spec list is pinned here.
 const REQUIRED_CI_SMOKE_SPECS = [
   'e2e/variant-live-smoke.spec.ts',
+  'e2e/country-brief.spec.ts',
   'e2e/mcp-grant-consent.spec.ts',
   'e2e/dashboard-news-request-budget.spec.ts',
+  'e2e/bootstrap-request-budget.spec.ts',
+  'e2e/bootstrap-hydration-request-budget.spec.ts',
+  'e2e/settings-panel-live-apply.spec.ts',
+  'e2e/settings-source-live-apply.spec.ts',
   'e2e/dashboard-lcp-attribution.spec.ts',
   'e2e/keyword-spike-flow.spec.ts',
   'e2e/breaking-news-banner-provenance.spec.ts',
   'e2e/a11y-axe-scan.spec.ts',
+  'e2e/map-overlay-marker-budget.spec.ts',
 ] as const;
 
 const REQUIRED_TEST_JOBS = [
@@ -62,6 +117,8 @@ const TIMEOUT_CAPPED_TEST_JOBS = [
   'consumer-prices',
   'sidecar',
   'convex-tests',
+  'variant-smoke-shards',
+  'variant-smoke-pro-webmcp',
   'variant-smoke-full',
   'resilience-validation-smoke',
   'desktop-config',
@@ -80,26 +137,24 @@ const REQUIRED_GATE_WORKFLOWS = [
 const REQUIRED_NON_TEST_GATE_CHECKS = [
   'typecheck',
   'biome',
+  'markdown',
   'public-docs',
   'security-audit',
   'stacked-merge-guard',
   'proto-freshness',
 ] as const;
 
-// Jobs the deploy gate cannot require under their own name, and the check that
-// blocks on their behalf instead. A matrix job publishes one check run per
-// matrix entry (`audit-lockfile (root)`, `audit-lockfile (scripts)`, …) and
-// never the bare job id, so listing the id in `required` would leave the gate
-// waiting on a check run that is never published — pending forever, which
-// deadlocks every PR. The `if: always()` aggregate job publishes the single
-// blocking check for the whole matrix instead.
-//
-// An entry here is honoured only when both halves still hold: the job's `name:`
-// is a template expression (so it structurally cannot be matched by id), and
-// the covering check is itself a required gate check. That keeps this table
-// from becoming a way to quietly drop a job out of the gate.
+// Jobs covered by an aggregate check rather than required under their own
+// names. Matrix jobs publish one check run per entry and have no single name
+// for the gate to match. A companion non-matrix job can share the same
+// aggregate so branch protection retains one stable public contract. Each
+// exemption is valid only while the required aggregate directly needs it.
 const GATE_CHECK_EXEMPTIONS: Record<string, { workflow: string; coveredBy: string }> = {
   'audit-lockfile': { workflow: 'Security Audit', coveredBy: 'security-audit' },
+  'audit-rust': { workflow: 'Security Audit', coveredBy: 'security-audit' },
+  'unit-shards': { workflow: 'Test', coveredBy: 'unit' },
+  'variant-smoke-shards': { workflow: 'Test', coveredBy: 'variant-smoke-full' },
+  'variant-smoke-pro-webmcp': { workflow: 'Test', coveredBy: 'variant-smoke-full' },
 };
 
 const REQUIRED_RESILIENCE_VALIDATION_INPUTS = [
@@ -138,7 +193,7 @@ function workflowRegexNeedle(path: string): string {
 }
 
 function shellAwkAssignmentBlock(variable: string): string {
-  const start = `${variable}=$(echo "$FILES" | awk '`;
+  const start = `${variable}=$(printf '%s\\n' "$FILES" | awk '`;
   const startIndex = testWorkflow.indexOf(start);
   assert.notEqual(startIndex, -1, `test.yml must define ${variable}`);
   const end = "\n          ')";
@@ -215,6 +270,15 @@ function stepPaths(stepBlock: string): string[] {
     .split('\n')
     .map((line) => line.trim().replace(/\/$/, ''))
     .filter((line) => line.length > 0);
+}
+
+function shellArgvTokens(command: string): string[] {
+  const tokens: string[] = [];
+  for (const token of command.trim().split(/\s+/)) {
+    if (token.startsWith('#')) break;
+    tokens.push(token);
+  }
+  return tokens;
 }
 
 function workflowRunScript(stepBlock: string): string {
@@ -324,7 +388,7 @@ function parseJsonArrayLiteral(source: string, regex: RegExp, label: string): st
 }
 
 function deployGateRequiredChecks(): string[] {
-  return parseJsonArrayLiteral(deployGateWorkflow, /\n\s*required='(\[[^\n]+])'/, 'required checks');
+  return parseJsonArrayLiteral(deployGateScript, /\n\s*required='(\[[^\n]+])'/, 'required checks');
 }
 
 function deployGateWorkflowRunNames(): string[] {
@@ -351,7 +415,341 @@ function securityAuditMatrixLockfiles(): string[] {
   ).sort();
 }
 
+describe('MCP live smoke — the production detection net', () => {
+  const smokeWorkflow = read(resolve(workflowsDir, 'mcp-live-smoke.yml'));
+
+  // A 2026-09-03 FUNCTION_INVOCATION_FAILED outage ran 13:24→16:30 UTC and was
+  // caught by neither Sentry nor Axiom (the platform kills the function before
+  // any handler code runs, so nothing first-party can observe it). The schedule
+  // is therefore the only net for a failure BETWEEN deploys, and its cadence is
+  // the upper bound on how long one can run unnoticed. At `23 */6 * * *` the
+  // outage fell entirely between the 12:23 and 18:23 runs.
+  it('probes production at least four times an hour, not six-hourly', () => {
+    const crons = Array.from(
+      smokeWorkflow.matchAll(/^\s+- cron:\s*['"]([^'"]+)['"]/gm),
+      ([, value]) => value.trim(),
+    );
+    assert.equal(crons.length, 1, 'exactly one schedule entry');
+    const fields = crons[0].split(/\s+/);
+    assert.equal(fields.length, 5, `schedule must have exactly five fields; got "${crons[0]}"`);
+    const [minute, hour, dayOfMonth, month, dayOfWeek] = fields;
+    assert.match(
+      minute,
+      /^\*\/([1-9]|1[0-5])$/,
+      `schedule must run at least every 15 minutes; got "${crons[0]}". A sparser `
+        + 'cadence is how a multi-hour outage slips between two runs.',
+    );
+    assert.equal(hour, '*', 'the hour field must not narrow the schedule back down');
+    assert.equal(dayOfMonth, '*', 'the day-of-month field must not narrow the schedule back down');
+    assert.equal(month, '*', 'the month field must not narrow the schedule back down');
+    assert.equal(dayOfWeek, '*', 'the day-of-week field must not narrow the schedule back down');
+  });
+
+  // These three literals are the entire gate. GitHub's API returns
+  // environment 'Production' (capital P) and creator 'vercel[bot]' — verified
+  // against repos/koala73/worldmonitor/deployments on 2026-09-04. A drift to
+  // 'production' would skip every run while looking exactly like the healthy
+  // case, because most deployment_status events SHOULD skip (Preview, Railway,
+  // Mintlify, and the pending/in_progress states of all of them).
+  it('gates the per-deploy trigger on the shapes the GitHub API actually sends', () => {
+    assert.match(smokeWorkflow, /^\s+deployment_status:\s*$/m, 'per-deploy trigger present');
+    assert.match(smokeWorkflow, /deployment_status\.state == 'success'/);
+    assert.match(smokeWorkflow, /deployment\.environment == 'Production'/);
+    assert.match(smokeWorkflow, /deployment\.creator\.login == 'vercel\[bot\]'/);
+    // Without the escape hatch the schedule/push/dispatch runs would ALSO be
+    // evaluated against deployment_status fields and skip — disabling the net
+    // entirely rather than just the per-deploy half.
+    assert.match(smokeWorkflow, /github\.event_name != 'deployment_status' \|\|/);
+  });
+
+  it('checks out the deployed sha on a per-deploy run, not the branch tip', () => {
+    assert.match(
+      smokeWorkflow,
+      /ref:\s*\$\{\{\s*github\.event_name == 'deployment_status' && github\.event\.deployment\.sha/,
+    );
+  });
+
+  it('runs on pushes that change the mcp-proxy probe helper', () => {
+    const pushBlock = smokeWorkflow.match(/\n {2}push:\n[\s\S]*?(?=\n {2}[a-z_]+:)/)?.[0];
+    assert.ok(pushBlock, 'MCP live smoke workflow must define a push trigger');
+    assert.match(pushBlock, /^\s+- 'scripts\/mcp-proxy-live-smoke\.mjs'\s*$/m);
+  });
+
+  // Workflow-level concurrency lets a pending or in-progress Production event
+  // evict a QUEUED successful-production smoke before the job gate skips it.
+  // An evicted run reads as neither pass nor fail, which is the worst outcome
+  // for a detection net.
+  it('applies concurrency only after the deployment-status gate', () => {
+    const smokeJob = workflowJobBlock(smokeWorkflow, 'smoke');
+    assert.doesNotMatch(
+      smokeWorkflow,
+      /^concurrency:\s*$/m,
+      'workflow-level concurrency applies before the job gate, so a skipped deployment event can evict a queued probe',
+    );
+    assert.match(smokeJob, /^\s{4}concurrency:\s*$/m);
+    assert.match(smokeJob, /group:\s*mcp-live-smoke-\$\{\{[^}]*deployment\.environment/);
+    assert.match(smokeJob, /cancel-in-progress:\s*false/);
+  });
+});
+
+describe('live cache sweep deployment timing', () => {
+  it('runs after successful production deploys and retains scheduled and manual checks', () => {
+    const workflow = YAML.parse(read(resolve(workflowsDir, 'live-api-cache-auth.yml')));
+    assert.ok(Object.hasOwn(workflow.on, 'deployment_status'));
+    assert.equal(workflow.on.push, undefined, 'a merge is not a completed production deployment');
+    assert.deepEqual(workflow.on.schedule, [{ cron: '47 */6 * * *' }]);
+    assert.ok(Object.hasOwn(workflow.on, 'workflow_dispatch'));
+
+    const job = workflow.jobs.sweep;
+    for (const [event, state, environment, creator, expected] of [
+      ['deployment_status', 'success', 'Production', 'vercel[bot]', true],
+      ['deployment_status', 'pending', 'Production', 'vercel[bot]', false],
+      ['deployment_status', 'failure', 'Production', 'vercel[bot]', false],
+      ['deployment_status', 'success', 'Preview', 'vercel[bot]', false],
+      ['deployment_status', 'success', 'Production', 'railway[bot]', false],
+      ['schedule', '', '', '', true],
+      ['workflow_dispatch', '', '', '', true],
+    ]) {
+      const github = { event_name: event, event: event === 'deployment_status' ? {
+        deployment_status: { state },
+        deployment: { environment, creator: { login: creator } },
+      } : {} };
+      assert.equal(runInNewContext(job.if, { github }, { timeout: 1000 }), expected, `${event}/${state}/${environment}/${creator}`);
+    }
+    assert.equal(workflow.concurrency, undefined);
+    assert.equal(job.concurrency['cancel-in-progress'], false);
+    // Keyed on the deployment environment, as in mcp-live-smoke: one shared group
+    // would let schedule, dispatch and Production runs evict each other while pending.
+    assert.match(job.concurrency.group, /deployment\.environment/);
+    assert.match(job.steps[0].with.ref, /github\.event\.deployment\.sha/);
+    assert.match(job.steps[0].with.ref, /\|\| github\.sha/, 'schedule and dispatch runs must fall back to github.sha');
+    const probe = job.steps.find((step: { env?: Record<string, string> }) => step.env?.LIVE_API_CACHE_TESTS === '1');
+    assert.ok(probe);
+    // The marker list and the pass count are both load-bearing (see the run step's
+    // comment): a name dropped from the loop silently stops enforcing that probe
+    // group, and the count must track the suite's markers plus its self-check.
+    const probeLoop = probe.run.match(/for probe in ([a-z -]+); do/);
+    assert.ok(probeLoop, 'the run step must enumerate the mandatory probe markers');
+    const enforced = probeLoop[1].split(' ');
+    assert.deepEqual(enforced, [
+      'bootstrap-auth', 'warm-cache', 'generated-rpc', 'premium-rpc',
+      'mcp-protocol', 'oauth-metadata', 'corpus-edge-cache', 'document-edge-cache',
+      'entry-document-edge-cache', 'agent-api-errors',
+    ]);
+    const suite = read(resolve(root, 'tests/live-api-cache-auth-regression.test.mjs'));
+    const emitted = [...suite.matchAll(/markProbeCompleted\('([a-z-]+)'\)/g)].map((m) => m[1]);
+    assert.deepEqual([...enforced].sort(), [...emitted].sort(), 'the workflow must enforce exactly the markers the suite emits');
+    const required = probe.run.match(/"\$pass_count" -lt (\d+)/);
+    assert.ok(required, 'the run step must require a minimum pass count');
+    assert.equal(Number(required[1]), emitted.length + 1, 'required passes = mandatory probe groups + the suite self-check');
+  });
+});
+
+// #7593: a `deployment_status` trigger is privileged — repo secrets and a
+// write-capable GITHUB_TOKEN are in scope — and these workflows check out
+// `github.event.deployment.sha`, so a dependency install there would resolve
+// THAT commit's lockfile and could write its package cache into the shared
+// Actions cache scope that main-branch runs restore from. PR #7591 shipped
+// exactly that shape (`cache: 'npm'` + `npm ci --ignore-scripts`) and the
+// #7605 emergency revert removed it; this guard keeps it from coming back.
+// Deliberately file-level and fail-closed: if a deployment_status workflow
+// ever genuinely needs npm, extend this guard consciously with the
+// event-scoping argument rather than special-casing around it.
+describe('deployment_status triggers — npm cache scope hygiene (#7593)', () => {
+  // Comment lines are not executable: the workflows themselves explain the
+  // absence ("no npm ci", #7593) and must not self-trip the guard. Round-trip
+  // through the YAML parser, which drops comments AND normalizes flow-map
+  // inputs (with: {cache: 'npm'}) into the same block form the ban patterns
+  // match, so neither spelling can hide behind syntax. If a future workflow
+  // carries YAML this parser rejects, fall back to the plain comment-line
+  // filter: weaker (comments survive), but the ban patterns themselves stay
+  // fail-closed on whatever text remains.
+  const executableText = (source: string): string =>
+  {
+    try {
+      const doc = YAML.parse(source);
+      return doc == null ? '' : YAML.stringify(doc);
+    } catch {
+      return source
+        .split('\n')
+        .filter((line) => !/^\s*#/.test(line))
+        .join('\n');
+    }
+  }
+
+  // Block-style (`on:\n  deployment_status:`) and flow-style (`on: [ … ]`)
+  // triggers; the block is the `on:` value up to the next column-0 key. Both
+  // forms tolerate a trailing YAML comment (`on: # ...`,
+  // `deployment_status: # ...`) — the guard is fail-closed, so a comment must
+  // never silently exclude a workflow from the sweep.
+  const triggersOnDeploymentStatus = (source: string): boolean => {
+    const flow = source.match(/^on:[ \t]*(?:#[^\n]*)?\s*\[([^\]]*)\]/m);
+    if (flow) return /['"]?deployment_status['"]?/.test(flow[1]);
+    const onIndex = source.search(/^on:(?:[ \t]*#[^\n]*)?\s*$/m);
+    if (onIndex === -1) return false;
+    const block = source.slice(onIndex).split(/\n(?=\S)/)[0];
+    return /^ {2}deployment_status:(?:[ \t]*#[^\n]*)?\s*$/m.test(block);
+  };
+
+  // The two ban patterns and the single detection path both tests below read.
+  // The sweep asserts real workflows stay clean; the self-test asserts the
+  // patterns can still fire, so a corrupted pattern reddens this suite
+  // instead of silently covering nothing.
+  // After the YAML round-trip a truthy cache input always appears as a
+  // block-mapping key, so the line-start anchor no longer depends on the
+  // author's block vs flow-map spelling. Only falsy scalars (false, null, ~)
+  // are exempt.
+  const CACHE_BAN_PATTERN = /^[ \t]*cache:[ \t]*(?!false\b)(?!null\b)(?!~)[^\s#]/m;
+  // `npm i` resolves the deployed SHA's lockfile exactly like `npm install`,
+  // so the alias spelling is banned too, under any shell whitespace
+  // (double space or a tab before the verb is the same command). The word
+  // boundaries keep npm info, npm init and pnpm i out of the ban.
+  const NPM_INSTALL_BAN_PATTERN = /\bnpm[ \t]+(?:ci|install|i)\b/;
+
+  const deploymentCacheProblems = (executable: string): string[] => {
+    const problems: string[] = [];
+    if (CACHE_BAN_PATTERN.test(executable)) {
+      problems.push(
+        'a step carries a truthy `cache:` input, so a privileged deployment_status run could save a package cache resolved from github.event.deployment.sha',
+      );
+    }
+    if (NPM_INSTALL_BAN_PATTERN.test(executable)) {
+      problems.push("the job runs npm ci/install, resolving the deployed SHA's lockfile instead of main's");
+    }
+    return problems;
+  };
+
+  it('keeps every deployment_status-triggered workflow free of package-cache writes and lockfile installs (#7593)', () => {
+    const scanned: string[] = [];
+    const offenders: string[] = [];
+
+    for (const file of readdirSync(workflowsDir)
+      .filter((name) => name.endsWith('.yml') || name.endsWith('.yaml'))
+      .sort()) {
+      const source = read(resolve(workflowsDir, file));
+      if (!triggersOnDeploymentStatus(source)) continue;
+      scanned.push(file);
+
+      const problems = deploymentCacheProblems(executableText(source));
+      if (problems.length > 0) offenders.push(`${file}\n    - ${problems.join('\n    - ')}`);
+    }
+
+    // Not vacuous: mcp-live-smoke.yml's deployment_status trigger is pinned
+    // by the describe above, so if the sweep stops seeing that file the
+    // trigger parser has broken and this guard is green while covering
+    // nothing.
+    assert.ok(
+      scanned.includes('mcp-live-smoke.yml'),
+      'the sweep matched no workflows — mcp-live-smoke.yml still triggers on deployment_status, so the trigger parser here is broken and this guard covers nothing',
+    );
+    assert.deepEqual(
+      offenders,
+      [],
+      '#7593: a deployment_status trigger is privileged (repo secrets, write-capable GITHUB_TOKEN) and these workflows check out github.event.deployment.sha, so resolving dependencies there could write a package cache built from a non-main lockfile into the shared scope main-branch runs restore from. PR #7591 shipped that shape and #7605 reverted it; if one of these workflows genuinely needs npm, extend this guard deliberately:\n' +
+        offenders.join('\n'),
+    );
+  });
+
+  // The sweep only asserts the absence of offenders, so a ban pattern that
+  // stopped matching (lost indentation anchor, dropped alternation branch)
+  // would keep this suite green while the guard detects nothing. This
+  // self-test feeds inline sources through the same deploymentCacheProblems
+  // path the sweep uses and pins the firing half of the guard.
+  it('keeps the ban patterns load-bearing: offenders fire and safe look-alikes stay silent (#7593)', () => {
+    const cacheProblem =
+      'a step carries a truthy `cache:` input, so a privileged deployment_status run could save a package cache resolved from github.event.deployment.sha';
+    const npmProblem = "the job runs npm ci/install, resolving the deployed SHA's lockfile instead of main's";
+
+    const offender = [
+      'name: offender',
+      'on:',
+      '  deployment_status:',
+      'jobs:',
+      '  smoke:',
+      '    steps:',
+      '      - uses: actions/setup-node@v4',
+      '        with:',
+      "          cache: 'npm'",
+      '      - run: npm ci --ignore-scripts --omit=optional',
+    ].join('\n');
+    assert.deepEqual(deploymentCacheProblems(executableText(offender)), [cacheProblem, npmProblem]);
+
+    // Flow-map syntax must trip the same bans: the parser normalizes the
+    // mapping, so the block-style fixture reshaped into a flow map detects
+    // identically (review finding: line-anchored pattern missed
+    // with: {node-version: '24', cache: 'npm'}).
+    const flowMapOffender = [
+      "name: flow-map-offender",
+      'on:',
+      '  deployment_status:',
+      'jobs:',
+      '  smoke:',
+      '    steps:',
+      "      - uses: actions/setup-node@v4",
+      "        with: { node-version: '24', cache: 'npm' }",
+      "      - run: npm ci --ignore-scripts --omit=optional",
+    ].join('\n');
+    assert.deepEqual(deploymentCacheProblems(executableText(flowMapOffender)), [cacheProblem, npmProblem]);
+
+    const aliasOffender = offender.replace(
+      'npm ci --ignore-scripts --omit=optional',
+      'npm i --omit=optional',
+    );
+    assert.ok(
+      deploymentCacheProblems(executableText(aliasOffender)).includes(npmProblem),
+      'npm i must be flagged the same as npm install',
+    );
+
+    // Shell whitespace between npm and the verb is legal and equally
+    // dangerous: double space and tab must fire like the single-space form
+    // (review finding: literal single space escaped detection).
+    for (const spaced of ['npm  ci --ignore-scripts', 'npm\tinstall --no-audit', 'npm\ti']) {
+      assert.ok(
+        deploymentCacheProblems(executableText(offender.replace('npm ci --ignore-scripts --omit=optional', spaced)))
+          .includes(npmProblem),
+        'irregular shell whitespace before the npm verb must not escape the ban: ' + spaced,
+      );
+    }
+
+    for (const safe of [
+      '        with:\n          cache: false',
+      "      # cache: 'npm'",
+      '        with:\n          cache-dependency-path: package-lock.json',
+      '      - run: npm run build',
+      "      - run: pnpm i --frozen-lockfile",
+      "      - run: npm info webpack",
+    ]) {
+      assert.deepEqual(deploymentCacheProblems(executableText(safe)), [], `must not flag safe input:\n${safe}`);
+    }
+
+    // Both trigger spellings must stay recognized through a trailing YAML
+    // comment, and a flow list without deployment_status must not be swept.
+    assert.equal(
+      triggersOnDeploymentStatus('on: # deploy hook\n  deployment_status: # success only'),
+      true,
+      'a trailing comment on either trigger line must not hide a deployment_status trigger',
+    );
+    assert.equal(triggersOnDeploymentStatus('on: [push, deployment_status]'), true);
+    assert.equal(triggersOnDeploymentStatus('on: [push, workflow_dispatch]'), false);
+  });
+});
+
 describe('CI workflow coverage', () => {
+  it('stages the regenerated sitemap and software dates in the weekly pulse PR', () => {
+    const pulseWorkflow = read(resolve(workflowsDir, 'crawlable-pulse-refresh.yml'));
+    const openPrStep = workflowStepBlock(pulseWorkflow, 'Open the weekly pulse PR');
+    assert.match(
+      openPrStep,
+      /git\s+add\s+"\$snapshot_path"\s+public\/sitemap\.xml\s+public\/sitemap-main\.xml\s+pro-test\/src\/generated\/teasers\.json\s+pro-test\/welcome\.html\s+pro-test\/index\.html/,
+      'weekly pulse PRs must include the sitemap and both shared software dates',
+    );
+    assert.match(
+      openPrStep,
+      /git commit -m "chore\(corpus\): refresh[^\n]+\n[\s\S]*npm run build:sitemap\n\s+git add public\/sitemap\.xml public\/sitemap-main\.xml\n[\s\S]*git commit -m "chore\(corpus\): align[^\n]+\n[\s\S]*node scripts\/build-sitemap\.mjs --check\n\s+git push/,
+      'publish the sitemap only after regenerating its dates from committed material sources',
+    );
+  });
+
   it('runs the proto breaking check against the full main history (#6114)', () => {
     const breakingJob = workflowJobBlock(protoCheckWorkflow, 'proto-breaking');
     assert.match(breakingJob, /^\s+needs: changes\s*$/m);
@@ -422,18 +820,14 @@ describe('CI workflow coverage', () => {
     }
   });
 
-  it('keeps every smoke spec on the combined ci-smoke command line', () => {
+  it('keeps every smoke spec on the combined command and exactly one shard', () => {
     const ciSmoke = packageScripts['test:e2e:ci-smoke'] ?? '';
     // Tokenize as the shell would, and stop at the first comment token: npm
     // scripts run under `sh -c`, where a word-initial `#` comments out the
     // rest of the line. A substring check would stay green with the spec
     // paths sitting in the commented-out tail while playwright never runs
     // them — the argv-token check is what gives this guard teeth.
-    const argvTokens: string[] = [];
-    for (const token of ciSmoke.trim().split(/\s+/)) {
-      if (token.startsWith('#')) break;
-      argvTokens.push(token);
-    }
+    const argvTokens = shellArgvTokens(ciSmoke);
     for (const spec of REQUIRED_CI_SMOKE_SPECS) {
       assert.ok(
         argvTokens.includes(spec),
@@ -449,6 +843,34 @@ describe('CI workflow coverage', () => {
       argvTokens.includes('VITE_VARIANT=full'),
       'test:e2e:ci-smoke must pin VITE_VARIANT=full — variant-live-smoke asserts the full-variant panel set',
     );
+
+    const smokeSpecs = argvTokens.filter((token) => token.startsWith('e2e/') && token.endsWith('.spec.ts'));
+    assert.equal(new Set(smokeSpecs).size, smokeSpecs.length, 'test:e2e:ci-smoke must not repeat a spec');
+    assert.deepEqual(
+      [...smokeSpecs].sort(),
+      [...REQUIRED_CI_SMOKE_SPECS].sort(),
+      'test:e2e:ci-smoke must contain exactly the pinned smoke-spec inventory',
+    );
+    const shardSpecs = ['test:e2e:ci-smoke:1', 'test:e2e:ci-smoke:2'].map((script) => {
+      const command = packageScripts[script] ?? '';
+      const tokens = shellArgvTokens(command);
+      assert.deepEqual(
+        tokens.slice(0, 4),
+        ['cross-env', 'VITE_VARIANT=full', 'playwright', 'test'],
+        `${script} must invoke the full-variant Playwright command before its smoke specs`,
+      );
+      const specs = tokens.filter((token) => token.startsWith('e2e/') && token.endsWith('.spec.ts'));
+      assert.ok(specs.length > 0, `${script} must pass smoke specs as live argv tokens`);
+      assert.equal(new Set(specs).size, specs.length, `${script} must not repeat a spec`);
+      return specs;
+    });
+    const intersection = shardSpecs[0].filter((spec) => shardSpecs[1].includes(spec));
+    assert.deepEqual(intersection, [], 'ci-smoke shards must be disjoint');
+    assert.deepEqual(
+      [...shardSpecs[0], ...shardSpecs[1]].sort(),
+      [...REQUIRED_CI_SMOKE_SPECS].sort(),
+      'the ci-smoke shard union must equal the pinned smoke-spec inventory',
+    );
   });
 
   it('keeps the main Test workflow jobs for defensibility smoke gates', () => {
@@ -463,25 +885,34 @@ describe('CI workflow coverage', () => {
     }
   });
 
-  it('does not let a hung playwright install-deps eat the variant-smoke-full budget', () => {
-    const job = testJobBlock('variant-smoke-full');
-    assert.match(job, /\n {4}timeout-minutes: 30\n/);
-    assert.match(
-      job,
-      /id: playwright-install-deps[\s\S]*timeout-minutes: 8[\s\S]*continue-on-error: true[\s\S]*npx playwright install-deps chromium/,
-    );
-    assert.match(
-      job,
-      /steps\.playwright-install-deps\.outcome == 'failure'[\s\S]*pkill -9 apt-get[\s\S]*npx playwright install --with-deps chromium/,
-    );
+  it('does not let a hung playwright install-deps eat a browser job budget', () => {
+    const browserJobs = workflowJobNames(testWorkflow, 'test.yml')
+      .filter((jobName) => /npm run test:e2e:/.test(testJobBlock(jobName)));
+    assert.deepEqual(browserJobs, ['variant-smoke-shards', 'variant-smoke-pro-webmcp']);
+    for (const jobName of browserJobs) {
+      const job = testJobBlock(jobName);
+      assert.match(job, /\n {4}timeout-minutes: 20\n/);
+      assert.match(
+        job,
+        /id: playwright-install-deps[\s\S]*timeout-minutes: 8[\s\S]*continue-on-error: true[\s\S]*npx playwright install-deps chromium/,
+      );
+      assert.match(
+        job,
+        /steps\.playwright-install-deps\.outcome == 'failure'[\s\S]*pkill -9 apt-get[\s\S]*npx playwright install --with-deps chromium/,
+      );
+    }
   });
 
   // #6496: playwright.config.ts retained a trace, a video and a screenshot for
   // every failed test and CI collected none of them, so run 31584738075 died
   // with the only evidence that could have named its browser close. The job is
   // required, so it reddens on flakes nobody can then diagnose.
-  it('collects what every playwright run in variant-smoke-full leaves behind (#6496)', () => {
-    const job = testJobBlock('variant-smoke-full');
+  it('collects what every playwright run in each browser job leaves behind (#6496)', () => {
+    const browserJobs = workflowJobNames(testWorkflow, 'test.yml')
+      .filter((jobName) => /npm run test:e2e:/.test(testJobBlock(jobName)));
+    assert.deepEqual(browserJobs, ['variant-smoke-shards', 'variant-smoke-pro-webmcp']);
+    for (const jobName of browserJobs) {
+      const job = testJobBlock(jobName);
 
     // The uploaded path has to be the directory Playwright actually writes.
     // The config leaves outputDir at its default, so that is `test-results`;
@@ -491,16 +922,15 @@ describe('CI workflow coverage', () => {
     const outputDir = (configuredOutputDir?.[1] ?? 'test-results').replace(/^\.\//, '').replace(/\/$/, '');
 
     const steps = jobSteps(job);
-    // `- run: …` (the whole step on the dash line) and `run: …` under a named
-    // step are both real here, and matching only the second form silently
-    // narrowed this guard to the WebMCP run alone.
+    // Include direct run values and commands inside a multiline shell step.
+    const smokeCommand = /\n\s*(?:(?:- )?run: )?npm run test:e2e:/g;
     const runs = steps
       .map((step, index) => ({ ...step, index }))
-      .filter((step) => /\n\s*(?:- )?run: npm run test:e2e:/.test(step.block));
-    assert.ok(runs.length > 0, 'variant-smoke-full must still invoke playwright');
+      .filter((step) => [...step.block.matchAll(smokeCommand)].length > 0);
+    assert.ok(runs.length > 0, `${jobName} must invoke playwright`);
     assert.equal(
       runs.length,
-      (job.match(/\n\s*(?:- )?run: npm run test:e2e:/g) ?? []).length,
+      [...job.matchAll(smokeCommand)].length,
       'every `npm run test:e2e:*` line in the job must be attributed to exactly one step — if this ' +
         'fails the step splitter has drifted and the per-run checks below cover less than they claim',
     );
@@ -555,6 +985,14 @@ describe('CI workflow coverage', () => {
       `each playwright run's artifact needs its own name — upload-artifact rejects a duplicate name ` +
         `within one run, so a collision drops one run's traces entirely. Got: ${artifactNames.join(', ')}`,
     );
+    }
+
+    const shardJob = testJobBlock('variant-smoke-shards');
+    assert.match(
+      shardJob,
+      /name: playwright-ci-smoke-\$\{\{ matrix\.shard \}\}-\$\{\{ github\.run_id \}\}-\$\{\{ github\.run_attempt \}\}/,
+      'matrix shards must publish distinct ci-smoke artifact names',
+    );
   });
 
   it('keeps the deploy gate wired to every Test workflow check job', () => {
@@ -568,17 +1006,18 @@ describe('CI workflow coverage', () => {
       );
     }
     for (const job of workflowJobNames(testWorkflow, 'test.yml')) {
+      const coveredBy = GATE_CHECK_EXEMPTIONS[job]?.coveredBy ?? job;
       assert.ok(
-        requiredChecks.includes(job),
-        `deploy-gate.yml must require every test.yml job; missing ${job}`,
+        requiredChecks.includes(coveredBy),
+        `deploy-gate.yml must require every test.yml job; missing ${coveredBy}`,
       );
     }
     for (const check of REQUIRED_NON_TEST_GATE_CHECKS) {
       assert.ok(requiredChecks.includes(check), `deploy-gate.yml must require ${check}`);
     }
     assert.match(
-      deployGateWorkflow,
-      /All required PR gates passed/,
+      deployGateScript,
+      /post_gate_status "success" "All required PR gates passed"/,
       'deploy-gate.yml success status must describe the full gate set',
     );
     assert.doesNotMatch(
@@ -611,12 +1050,15 @@ describe('CI workflow coverage', () => {
 
         if (exemption && exemption.workflow === workflowName) {
           assert.ok(
-            templated,
-            `${workflowName}/${job} is exempt from the gate only because its check-run name is templated, but it publishes the literal name ${name} — require it directly instead`,
-          );
-          assert.ok(
             requiredChecks.includes(exemption.coveredBy),
             `${workflowName}/${job} is exempt because ${exemption.coveredBy} blocks on its behalf, so ${exemption.coveredBy} must itself be a required gate check`,
+          );
+          const parsed = YAML.parse(source) as { jobs?: Record<string, { needs?: string | string[] }> };
+          const aggregateNeedsValue = parsed.jobs?.[exemption.coveredBy]?.needs ?? [];
+          const aggregateNeeds = Array.isArray(aggregateNeedsValue) ? aggregateNeedsValue : [aggregateNeedsValue];
+          assert.ok(
+            aggregateNeeds.includes(job),
+            `${workflowName}/${job} is exempt because ${exemption.coveredBy} blocks on its behalf, so that aggregate must directly need ${job}`,
           );
           continue;
         }
@@ -719,12 +1161,12 @@ describe('CI workflow coverage', () => {
   });
 
   it('batches pending and stale-contract gate discovery during the scheduled self-healing sweep', () => {
-    const deployGateJob = workflowJobBlock(deployGateWorkflow, 'gate');
+    const deployGateJob = deployGateScript;
 
     assert.match(
       deployGateWorkflow,
-      /^ {2}group: deploy-gate-\$\{\{ github\.event\.workflow_run\.head_sha \|\| github\.event\.inputs\.sha \|\| 'sweep' \}\}$/m,
-      'schedule and empty dispatches share one sweep group; workflow_run and sha-input dispatches stay keyed by SHA',
+      /^ {6}group: deploy-gate-\$\{\{ matrix\.sha \}\}$/m,
+      'all writer jobs use the same SHA-keyed group',
     );
     assert.match(
       deployGateWorkflow,
@@ -736,9 +1178,9 @@ describe('CI workflow coverage', () => {
     assert.match(deployGateJob, /pullRequests\(first: 100, states: \[OPEN\], after: \$endCursor\)/);
     assert.match(deployGateJob, /pageInfo \{ hasNextPage endCursor \}/);
     assert.match(deployGateJob, /contexts\(first: 100, after: \$endCursor\)/);
-    assert.match(deployGateJob, /status \{ context\(name: "gate"\) \{ state description \} \}/);
+    assert.match(deployGateJob, /status \{ context\(name: "gate"\) \{ state description createdAt \} \}/);
     assert.match(deployGateJob, /stale_terminal_shas=/);
-    assert.match(deployGateJob, /\$gate\.state != "PENDING"/);
+    assert.match(deployGateJob, /\$gate\.state == "SUCCESS"/);
     assert.match(deployGateJob, /context\.state == "PENDING"/);
     assert.match(deployGateJob, /endswith\(\$gate_stamp\) \| not/);
     assert.match(deployGateJob, /awk '!seen\[\$0\]\+\+'/);
@@ -754,6 +1196,49 @@ describe('CI workflow coverage', () => {
       /commits\/\$s\/statuses/,
       'the sweep must not spend one paginated REST request per open PR',
     );
+  });
+
+  it('serializes every deploy-gate writer by SHA behind the sweep phase barriers', () => {
+    const workflow = YAML.parse(deployGateWorkflow) as {
+      concurrency?: unknown;
+      jobs?: Record<string, {
+        concurrency?: { group?: string; queue?: string; 'cancel-in-progress'?: boolean };
+        needs?: string | string[];
+        if?: string;
+        strategy?: { 'fail-fast'?: boolean };
+        steps?: Array<{ uses?: string; with?: Record<string, unknown>; if?: string; run?: string }>;
+      }>;
+    };
+    const jobs = workflow.jobs ?? {};
+
+    assert.equal(workflow.concurrency, undefined, 'the controller must not hold a writer lock');
+    assert.deepEqual(jobs.recover?.needs, ['discover', 'invalidate']);
+    assert.equal(jobs.evaluate?.needs, 'recover');
+    assert.deepEqual(jobs.gate?.needs, ['discover', 'invalidate', 'recover', 'evaluate']);
+    assert.match(jobs.recover?.if ?? '', /always\(\).*needs\.discover\.result == 'success'/);
+    assert.match(jobs.evaluate?.if ?? '', /always\(\).*needs\.recover\.result == 'success'.*outputs\.count != '0'/);
+    assert.match(jobs.invalidate?.if ?? '', /needs\.discover\.result == 'success'.*outputs\.count != '0'/);
+    assert.equal(jobs.gate?.if, '${{ always() }}');
+
+    for (const name of ['invalidate', 'evaluate']) {
+      assert.equal(jobs[name]?.concurrency?.group, 'deploy-gate-${{ matrix.sha }}', `${name} must own the SHA lock`);
+      assert.equal(jobs[name]?.concurrency?.queue, 'max', `${name} must not replace older pending writers`);
+      assert.equal(jobs[name]?.concurrency?.['cancel-in-progress'], false, `${name} must not interrupt an active writer`);
+      assert.equal(jobs[name]?.strategy?.['fail-fast'], false, `${name} must finish unrelated SHA work`);
+    }
+
+    for (const name of ['discover', 'invalidate', 'recover', 'evaluate']) {
+      const checkout = jobs[name]?.steps?.find((step) => step.uses?.startsWith('actions/checkout@'));
+      assert.equal(checkout?.with?.ref, '${{ github.workflow_sha }}', `${name} must execute trusted workflow code`);
+      assert.equal(checkout?.with?.['persist-credentials'], false);
+    }
+    const upload = jobs.invalidate?.steps?.find((step) => step.uses?.startsWith('actions/upload-artifact@'));
+    assert.equal(upload?.if, '${{ always() }}');
+    assert.equal(upload?.with?.name, 'deploy-gate-invalidate-${{ github.run_attempt }}-${{ matrix.sha }}');
+    assert.equal(upload?.with?.['if-no-files-found'], 'error');
+    const download = jobs.recover?.steps?.find((step) => step.uses?.startsWith('actions/download-artifact@'));
+    assert.equal(download?.with?.pattern, 'deploy-gate-invalidate-${{ github.run_attempt }}-*');
+    assert.notEqual(download?.with?.['merge-multiple'], true, 'per-SHA result files must not overwrite one another');
   });
 
   it('treats sidecar changes as code for PR smoke gating', () => {
@@ -828,7 +1313,7 @@ describe('CI workflow coverage', () => {
       assert.ok(!codeFilterSays(path), `${path} must not set code=true`);
     }
 
-    const unit = testJobBlock('unit');
+    const unit = testJobBlock('unit-shards');
     assert.match(
       unit,
       /^\s+run: node scripts\/openapi-capacity-report\.mjs --out "\$RUNNER_TEMP\/openapi-capacity\.json"\s*$/m,
@@ -844,7 +1329,7 @@ describe('CI workflow coverage', () => {
     );
     assert.match(
       unit,
-      /name: openapi-capacity-\$\{\{ github\.run_attempt \}\}/,
+      /name: openapi-capacity-\$\{\{ matrix\.shard \}\}-\$\{\{ github\.run_attempt \}\}/,
       'the capacity artifact name must carry run_attempt — upload-artifact v6 rejects a duplicate name within a run, which collides on the re-run started to chase the failure',
     );
     assert.match(
@@ -880,18 +1365,84 @@ describe('CI workflow coverage', () => {
     }
   });
 
-  it('runs resilience-validation-smoke only when validation inputs change', () => {
+  it('runs resilience-validation-smoke only for validation changes that skip unit', () => {
     const job = testJobBlock('resilience-validation-smoke');
     assert.match(
       job,
-      /\n {4}if: needs\.changes\.outputs\.validation == 'true'\n/,
-      'the smoke job is the validation-docs path; unit already runs the same files on code PRs',
+      /\n {4}if: needs\.changes\.outputs\.validation == 'true' && needs\.changes\.outputs\.code != 'true'\n/,
+      'the smoke job is the validation-docs path; unit already runs the same files whenever code changed (#7772)',
     );
     assert.doesNotMatch(
       job,
       /outputs\.code == 'true'/,
       'a second npm ci on every code PR re-runs tests already inside test:data',
     );
+  });
+
+  it('lints markdown once, in a gate-required job that skips when no markdown changed (#7772)', () => {
+    const markdownJob = workflowJobBlock(lintCodeWorkflow, 'markdown');
+    assert.match(markdownJob, /\n {4}needs: changes\n/);
+    assert.match(
+      markdownJob,
+      /\n {4}if: needs\.changes\.outputs\.markdown == 'true'\n/,
+      'markdown lint must skip on PRs that touch no markdown; the gate counts skipped as passing',
+    );
+    assert.match(markdownJob, /\n {6}- run: npm run lint:md\n/);
+    assert.doesNotMatch(
+      markdownJob,
+      /continue-on-error/,
+      'a continue-on-error on the lint step would turn the required check green while lint is red',
+    );
+    assert.match(markdownJob, /\n {4}timeout-minutes: \d+\n/, 'a hung npm ci must not hold the deploy gate for the 360-minute default');
+    assert.doesNotMatch(
+      workflowJobBlock(lintCodeWorkflow, 'biome'),
+      /lint:md/,
+      'biome used to lint markdown too, so a code+markdown PR linted it twice',
+    );
+    assert.equal(
+      (workflowText.match(/npm run lint:md(?=\s|$)/g) ?? []).length,
+      1,
+      'exactly one workflow step owns markdown lint',
+    );
+    assert.ok(
+      !existsSync(resolve(workflowsDir, 'lint.yml')),
+      'lint.yml was the second owner; a path-filtered workflow publishes no check run on code PRs, so it can never be gate-required',
+    );
+    assert.ok(
+      deployGateRequiredChecks().includes('markdown'),
+      'markdown lint left biome (a branch-protection context), so it must block through the gate instead',
+    );
+
+    const parsed = YAML.parse(lintCodeWorkflow) as { jobs: Record<string, { outputs?: Record<string, string> }> };
+    assert.equal(parsed.jobs.changes.outputs?.markdown, '${{ steps.diff.outputs.markdown }}');
+    assert.match(lintCodeWorkflow, /echo "markdown=true" >> "\$GITHUB_OUTPUT"/, 'pushes to main keep markdown coverage');
+
+    // The filter must fire for every lint:md input (the markdown, its config,
+    // and package.json, which holds the command and pins markdownlint-cli2:
+    // LINT_MD_INPUTS from .husky/pre-push plus the lockfile) and stay quiet
+    // for a code-only PR, or the job either never runs or runs on every PR.
+    const filter = lintCodeWorkflow.match(/^ +MARKDOWN=\$\([^\n]*\)\n +echo "markdown=[^\n]*$/m)?.[0];
+    assert.ok(filter, 'lint-code.yml must derive markdown= from the PR file list');
+    const markdownSays = (files: string[]): string => {
+      const fileArgs = files.map((file) => JSON.stringify(file)).join(' ');
+      const body = filter.replace(/>> "\$GITHUB_OUTPUT"/, '');
+      const script = `FILES=$(printf '%s\\n' ${fileArgs})\n${body}`;
+      return execFileSync('bash', ['-euo', 'pipefail', '-c', script], { encoding: 'utf8' }).trim();
+    };
+    assert.equal(markdownSays(['docs/solutions/example.md']), 'markdown=true');
+    assert.equal(markdownSays(['.markdownlint-cli2.jsonc']), 'markdown=true');
+    assert.equal(markdownSays(['.markdownlintignore']), 'markdown=true');
+    assert.equal(markdownSays(['package.json']), 'markdown=true', 'package.json defines lint:md');
+    assert.equal(markdownSays(['package-lock.json']), 'markdown=true', 'the lockfile pins markdownlint-cli2');
+    assert.equal(markdownSays(['src/app/App.ts', 'README.md']), 'markdown=true');
+    assert.equal(markdownSays(['src/app/App.ts', 'api/bootstrap.js']), 'markdown=false');
+    assert.equal(markdownSays(['docs/adding-endpoints.mdx']), 'markdown=false', 'lint:md targets **/*.md only');
+    // The .md-only expectation above is only right while lint:md itself
+    // targets nothing else; widening the script must fail here until the
+    // filter is widened with it, or an mdx-only PR would skip a lint that
+    // covers it and the gate would read the skip as passing.
+    const lintMdGlobs = shellArgvTokens(packageScripts['lint:md'] ?? '').filter((token) => /^'[^!]/.test(token));
+    assert.deepEqual(lintMdGlobs, ["'**/*.md'"], 'the markdown change filter mirrors the positive lint:md glob; widen both together');
   });
 
   it('path-filters Test jobs on push to main instead of compiling everything', () => {
@@ -1034,7 +1585,7 @@ describe('CI workflow coverage', () => {
     // it back to a narrower path-gated job would silently re-open the
     // "bundle-breaking change with green PR CI" gap.
     assert.match(
-      testJobBlock('unit'),
+      testJobBlock('unit-shards'),
       /^\s+node scripts\/build-sidecar-handlers\.mjs\s*$/m,
       'unit job must run the sidecar handler bundle build',
     );
@@ -1048,11 +1599,13 @@ describe('CI workflow coverage', () => {
       'desktop-config job must run the desktop build env parity check',
     );
     assert.match(
-      testJobBlock('unit'),
+      testJobBlock('unit-shards'),
       /^\s+run: node scripts\/check-desktop-build-env\.mjs\s*$/m,
       'unit job must run the desktop build env parity check',
     );
-    const releasePreflight = workflowStepBlock(desktopBuildWorkflow, 'Release client-env preflight (#5905)');
+    const releasePreflight = workflowStepBlock(
+      workflowJobBlock(desktopBuildWorkflow, 'client-env'), 'Release client-env preflight (#5905)',
+    );
     assert.match(releasePreflight, /\[ "\$\{\{ github\.event_name \}\}" = "push" \] \|\|/);
     assert.match(releasePreflight, /\[ "\$\{\{ github\.event_name \}\}" = "workflow_dispatch" \]/);
     assert.match(releasePreflight, /\[ "\$\{\{ github\.event\.inputs\.draft \}\}" != "true" \]/);

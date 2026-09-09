@@ -1,10 +1,13 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import { readdirSync, readFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { BrowserClient, defaultStackParser } from '@sentry/browser';
 import { isDebugBearRumScriptFrame } from '../src/bootstrap/debugbear-rum.ts';
 import { isIosLikeUserAgent } from '../src/bootstrap/platform-ua.ts';
+import { isolateNonProductionSentryEvent } from '../shared/sentry-build-metadata.ts';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -43,6 +46,7 @@ assert.ok(tpMatch, 'THIRD_PARTY_FETCH_HOST_ALLOWLIST must be defined in src/boot
 // eslint-disable-next-line no-new-func
 const rawBeforeSend = new Function(
   'event', 'isDebugBearRumScriptFrame', 'isIosLikeUserAgent', 'navigator',
+  'isolateNonProductionSentryEvent', 'environment',
   `${tpMatch[0]}\n${fnBody}`,
 );
 
@@ -57,8 +61,8 @@ const IOS_NAVIGATOR = { userAgent: IOS_GOOGLE_APP_UA, maxTouchPoints: 5 };
 /** iPadOS 13+ desktop mode: Macintosh UA, but touch-capable. */
 const IPADOS_NAVIGATOR = { userAgent: MAC_DESKTOP_UA, maxTouchPoints: 5 };
 
-function beforeSend(event, navigatorStub = DESKTOP_NAVIGATOR) {
-  return rawBeforeSend(event, isDebugBearRumScriptFrame, isIosLikeUserAgent, navigatorStub);
+function beforeSend(event, navigatorStub = DESKTOP_NAVIGATOR, environment = 'production') {
+  return rawBeforeSend(event, isDebugBearRumScriptFrame, isIosLikeUserAgent, navigatorStub, isolateNonProductionSentryEvent, environment);
 }
 
 // Extract the `ignoreErrors` array literal so tests can assert which messages
@@ -151,6 +155,39 @@ describe('ignoreErrors filters', () => {
 // ─── P2: firstPartyFile regex covers all Vite chunk patterns ─────────────
 
 describe('first-party file detection', () => {
+  // Runs `filter` in a child so a catastrophic-backtracking regression fails on
+  // the spawnSync deadline instead of hanging the suite (`node --test` sets no
+  // default timeout, so an in-process hang would never go red).
+  //
+  // Both cases run in ONE child, because the malformed case alone cannot tell
+  // "the regex ran and terminated" from "firstPartyFile was never reached": a
+  // short-circuit above the call (e.g. gating `hasFirstParty` on frame count)
+  // keeps the malformed event DROPPED and the guard green with the ReDoS live.
+  // The well-formed chunk is the positive control — it goes red under exactly
+  // that mutation, which pins the guard to the predicate it is guarding.
+  it('finishes filtering a malformed asset filename with many hyphens', () => {
+    const malformed = makeEvent('.trim is not a function', 'TypeError', [
+      { filename: `/assets/${'a-'.repeat(64)}!`, lineno: 10, function: 'doStuff' },
+    ]);
+    const wellFormed = makeEvent('.trim is not a function', 'TypeError', [
+      { filename: '/assets/main-AbC123.js', lineno: 10, function: 'doStuff' },
+    ]);
+    const child = spawnSync(process.execPath, ['--input-type=module', '-e', `
+      const filter = ${rawBeforeSend.toString()};
+      const run = event => filter(event, () => false, () => false,
+        ${JSON.stringify(DESKTOP_NAVIGATOR)}, event => event, 'production');
+      process.stdout.write(JSON.stringify({
+        malformed: run(${JSON.stringify(malformed)}),
+        wellFormed: run(${JSON.stringify(wellFormed)}),
+      }));
+    `], { encoding: 'utf8', timeout: 5000 });
+    assert.equal(child.error?.code, undefined, 'Filtering must finish within five seconds');
+    assert.equal(child.status, 0, child.stderr);
+    const result = JSON.parse(child.stdout);
+    assert.equal(result.malformed, null, 'malformed /assets/ filename is not first-party');
+    assert.notEqual(result.wellFormed, null, 'positive control: a real chunk stays first-party');
+  });
+
   // Note: deck-stack is a VENDOR chunk (@deck.gl/@luma.gl), not first-party app code.
   // It is correctly caught by the "entirely within maplibre/deck.gl internals" filter.
   const testPatterns = [
@@ -387,6 +424,21 @@ describe('dynamic-module-import failures (stale chunk after deploy)', () => {
 // (WORLDMONITOR-66 / WORLDMONITOR-62).
 
 describe('zero-frame async-rejection patterns (timeout / DOMException / OOM / DOM-walker / wrapper-injected timeout)', () => {
+  for (const dispatch of ['direct', 'queued']) {
+    it(`preserves a zero-frame timeout explicitly reported by ${dispatch} panel dispatch`, async () => {
+      const client = new BrowserClient({ stackParser: defaultStackParser, integrations: [] });
+      const reason = new DOMException('signal timed out', 'TimeoutError');
+      // Model the browser timer boundary, without Node's constructor frames.
+      Object.defineProperty(reason, 'stack', { value: '' });
+      assert.ok(reason instanceof Error);
+      const event = await client.eventFromException(reason);
+      assert.equal(event.exception.values[0].stacktrace?.frames?.length ?? 0, 0);
+      event.tags = { kind: 'panel_call_rejected', panel: 'insights', method: 'updateInsights', dispatch };
+      assert.equal(isIgnored('signal timed out'), false);
+      assert.equal(beforeSend(event), event);
+    });
+  }
+
   const zeroFrameErrors = [
     ['signal timed out', 'TimeoutError'],
     ['NotSupportedError: The operation is not supported.', 'Error'],
@@ -1825,6 +1877,25 @@ describe('host-attributed fetch failures are fingerprinted by host (WORLDMONITOR
     { filename: '/assets/widget-store-DbqgxtxV.js', lineno: 0, function: 'Pn.window.fetch' },
     { filename: '/assets/analytics-DdK2NArM.js', lineno: 0, function: 'c' },
   ];
+
+  it('isolates non-production fetch groups after host attribution', () => {
+    for (const environment of ['preview', 'development']) {
+      for (const [host, bucket] of [
+        ['api.worldmonitor.app', 'api.worldmonitor.app'],
+        ['pub-8ace9f6a86d74cb2bd5eb1de5590dd9e.r2.dev', 'pub-8ace9f6a86d74cb2bd5eb1de5590dd9e.r2.dev'],
+        ['foreign.example', 'third-party'],
+      ]) {
+        const input = makeEvent(`Failed to fetch (${host})`, 'TypeError', zgStack);
+        input.release = 'a'.repeat(40);
+        input.dist = 'a'.repeat(40);
+        const event = beforeSend(input, DESKTOP_NAVIGATOR, environment);
+        assert.ok(event !== null);
+        assert.deepEqual(event.fingerprint, ['fetch-failure', bucket, `worldmonitor:${environment}`]);
+        assert.equal(event.release, undefined);
+        assert.equal(event.dist, undefined);
+      }
+    }
+  });
 
   it('gives a first-party origin failure its own fingerprint', () => {
     const event = beforeSend(makeEvent('Failed to fetch (api.worldmonitor.app)', 'TypeError', zgStack));

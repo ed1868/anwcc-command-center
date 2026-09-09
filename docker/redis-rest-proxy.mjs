@@ -267,34 +267,75 @@ const X_POST_BUDGET_RESERVE_SCRIPT = [
   'local coverageUnit = tonumber(ARGV[9]) or 0',
   'local hasCoverageUnit = ARGV[10] == "1"',
   'local hasReceipt = ARGV[11] == "1"',
+  'local coverageModel = ARGV[12] or ""',
+  'local deadlineMs = tonumber(ARGV[13]) or 0',
   'local dayUsed = tonumber(redis.call("get", KEYS[1]) or "0")',
   'local monthUsed = tonumber(redis.call("get", KEYS[2]) or "0")',
   'local coverageRaw = redis.call("get", KEYS[5])',
   'local coverageHeld = tonumber(coverageRaw or "0") or 0',
+  'local coverageModelRaw = redis.call("get", KEYS[9])',
   'if hasReceipt then',
   '  local pendingReceipt = redis.call("get", KEYS[7])',
   '  if pendingReceipt ~= false then return {0, dayUsed, monthUsed, 4, coverageHeld, pendingReceipt} end',
   '  if redis.call("exists", KEYS[8]) == 1 then return {0, dayUsed, monthUsed, 5, coverageHeld, ""} end',
   'end',
-  'if coverageRaw == false and coverageTotal > 0 then',
-  '  coverageHeld = coverageTotal',
-  '  redis.call("set", KEYS[5], coverageHeld, "EXAT", tonumber(ARGV[5]))',
+  'if deadlineMs > 0 then',
+  '  local serverTime = redis.call("time")',
+  '  local serverNowMs = (tonumber(serverTime[1]) * 1000) + math.floor(tonumber(serverTime[2]) / 1000)',
+  '  if serverNowMs >= deadlineMs then return {0, dayUsed, monthUsed, 7, coverageHeld, ""} end',
+  'end',
+  'local coverageEffectiveHeld = coverageHeld',
+  'local coverageShouldWrite = false',
+  'local hasCoverageState = coverageRaw ~= false or coverageModelRaw ~= false',
+  'if hasCoverageState then',
+  '  if (coverageRaw == false) ~= (coverageModelRaw == false) then return {0, dayUsed, monthUsed, 6, coverageHeld, ""} end',
+  '  local canonicalHeld = coverageRaw == "0" or string.match(coverageRaw, "^[1-9]%d*$") ~= nil',
+  '  local storedTotalRaw = string.match(coverageModelRaw, "^fixed%-slots%-v1:([1-9]%d*)$")',
+  '  local storedTotal = tonumber(storedTotalRaw)',
+  '  if not canonicalHeld or storedTotal == nil or storedTotal > dailyLimit then return {0, dayUsed, monthUsed, 6, coverageHeld, ""} end',
+  '  if coverageHeld > storedTotal then return {0, dayUsed, monthUsed, 6, coverageHeld, ""} end',
+  '  if coverageTotal > 0 then',
+  '    local requestedTotalRaw = string.match(coverageModel, "^fixed%-slots%-v1:([1-9]%d*)$")',
+  '    local requestedTotal = tonumber(requestedTotalRaw)',
+  '    if requestedTotal == nil or requestedTotal ~= coverageTotal or requestedTotal > dailyLimit or storedTotal < coverageTotal then return {0, dayUsed, monthUsed, 6, coverageHeld, ""} end',
+  '    local spent = storedTotal - coverageHeld',
+  '    if spent > coverageTotal then return {0, dayUsed, monthUsed, 6, coverageHeld, ""} end',
+  '    coverageEffectiveHeld = coverageTotal - spent',
+  '    coverageShouldWrite = storedTotal > coverageTotal',
+  '  end',
+  'elseif coverageTotal > 0 then',
+  '  local requestedTotalRaw = string.match(coverageModel, "^fixed%-slots%-v1:([1-9]%d*)$")',
+  '  local requestedTotal = tonumber(requestedTotalRaw)',
+  '  if requestedTotal == nil or requestedTotal ~= coverageTotal or requestedTotal > dailyLimit then return {0, dayUsed, monthUsed, 6, coverageHeld, ""} end',
+  '  coverageEffectiveHeld = coverageTotal',
+  '  coverageShouldWrite = true',
   'end',
   'local coverageAccounted = hasCoverageUnit and redis.call("exists", KEYS[6]) == 1',
-  'local coverageAfter = coverageHeld',
-  'if hasCoverageUnit and not coverageAccounted then coverageAfter = math.max(0, coverageHeld - coverageUnit) end',
+  'if coverageAccounted then return {0, dayUsed, monthUsed, 3, coverageHeld, ""} end',
+  'if hasCoverageUnit and coverageEffectiveHeld < coverageUnit then return {0, dayUsed, monthUsed, 6, coverageHeld, ""} end',
+  'local coverageAfter = coverageEffectiveHeld',
+  'if hasCoverageUnit then coverageAfter = coverageEffectiveHeld - coverageUnit end',
   'local oncePerDay = ARGV[8] == "1"',
   'if oncePerDay and redis.call("exists", KEYS[4]) == 1 then return {0, dayUsed, monthUsed, 3, coverageHeld} end',
-  'if dayUsed + requested + coverageAfter > dailyLimit then return {0, dayUsed, monthUsed, 1, coverageHeld} end',
-  'if monthUsed + requested + coverageAfter > monthlyLimit then return {0, dayUsed, monthUsed, 2, coverageHeld} end',
+  'if dayUsed + requested + coverageAfter > dailyLimit then return {0, dayUsed, monthUsed, 1, coverageEffectiveHeld} end',
+  'if monthUsed + requested + coverageAfter > monthlyLimit then return {0, dayUsed, monthUsed, 2, coverageEffectiveHeld} end',
   'dayUsed = redis.call("incrby", KEYS[1], requested)',
   'monthUsed = redis.call("incrby", KEYS[2], requested)',
   'redis.call("expireat", KEYS[1], tonumber(ARGV[5]))',
   'redis.call("expireat", KEYS[2], tonumber(ARGV[6]))',
+  'if coverageShouldWrite or hasCoverageUnit then',
+  '  redis.call("set", KEYS[5], coverageAfter, "EXAT", tonumber(ARGV[5]))',
+  'end',
+  'if coverageShouldWrite then',
+  '  redis.call("set", KEYS[9], coverageModel, "EXAT", tonumber(ARGV[5]))',
+  'end',
+  'if hasCoverageUnit then',
+  '  redis.call("set", KEYS[6], "1", "EXAT", tonumber(ARGV[5]))',
+  'end',
   'redis.call("set", KEYS[3], requested, "EX", tonumber(ARGV[7]))',
   'if hasReceipt then redis.call("set", KEYS[8], KEYS[3], "EX", tonumber(ARGV[7])) end',
-  'if oncePerDay then redis.call("set", KEYS[4], KEYS[3], "EX", tonumber(ARGV[7])) end',
-  'return {1, dayUsed, monthUsed, 0, coverageHeld, ""}',
+  'if oncePerDay then redis.call("set", KEYS[4], "done", "EXAT", tonumber(ARGV[5])) end',
+  'return {1, dayUsed, monthUsed, 0, coverageAfter, ""}',
 ].join('\n');
 
 const X_POST_BUDGET_SETTLE_SCRIPT = [
@@ -303,11 +344,6 @@ const X_POST_BUDGET_SETTLE_SCRIPT = [
   'local receiptJson = ARGV[4]',
   'local receiptHash = ARGV[5]',
   'local storeReceipt = ARGV[6] == "1"',
-  'local hasOnce = ARGV[7] == "1"',
-  'local completeOnce = ARGV[8] == "1"',
-  'local hasCoverageUnit = ARGV[9] == "1"',
-  'local completeCoverage = ARGV[10] == "1"',
-  'local coverageUnit = tonumber(ARGV[11]) or 0',
   'local dayUsed = tonumber(redis.call("get", KEYS[1]) or "0")',
   'local monthUsed = tonumber(redis.call("get", KEYS[2]) or "0")',
   'local coverageHeld = tonumber(redis.call("get", KEYS[4]) or "0") or 0',
@@ -336,15 +372,6 @@ const X_POST_BUDGET_SETTLE_SCRIPT = [
   'end',
   'if storeReceipt then redis.call("set", KEYS[5], receiptJson) end',
   'if hasReceiptScope and redis.call("get", KEYS[6]) == KEYS[3] then redis.call("del", KEYS[6]) end',
-  'if hasOnce and redis.call("get", KEYS[7]) == KEYS[3] then',
-  '  if completeOnce then redis.call("set", KEYS[7], "done", "EXAT", tonumber(ARGV[2]))',
-  '  else redis.call("del", KEYS[7]) end',
-  'end',
-  'if hasCoverageUnit and completeCoverage and redis.call("exists", KEYS[8]) == 0 then',
-  '  coverageHeld = math.max(0, coverageHeld - coverageUnit)',
-  '  redis.call("set", KEYS[4], coverageHeld, "EXAT", tonumber(ARGV[2]))',
-  '  redis.call("set", KEYS[8], "1", "EXAT", tonumber(ARGV[2]))',
-  'end',
   'redis.call("set", KEYS[3], "settled:" .. actual .. ":" .. receiptHash, "EXAT", tonumber(ARGV[2]))',
   'return {1, dayUsed, monthUsed, reserved, actual, coverageHeld}',
 ].join('\n');
@@ -366,8 +393,87 @@ const X_POST_BUDGET_ACK_RECEIPTS_SCRIPT = [
 const X_POST_BUDGET_STATUS_SCRIPT = [
   'local dayUsed = tonumber(redis.call("get", KEYS[1]) or "0")',
   'local monthUsed = tonumber(redis.call("get", KEYS[2]) or "0")',
-  'local coverageHeld = tonumber(redis.call("get", KEYS[3]) or "0") or 0',
-  'return {dayUsed, monthUsed, coverageHeld}',
+  'local coverageRaw = redis.call("get", KEYS[3])',
+  'local coverageHeld = 0',
+  'local coverageState = 0',
+  'if coverageRaw ~= false then',
+  '  local canonicalHeld = coverageRaw == "0" or string.match(coverageRaw, "^[1-9]%d*$") ~= nil',
+  '  local parsedHeld = tonumber(coverageRaw)',
+  '  if canonicalHeld and parsedHeld ~= nil and parsedHeld <= 9007199254740991 then',
+  '    coverageHeld = parsedHeld',
+  '    coverageState = 1',
+  '  else',
+  '    coverageState = -1',
+  '  end',
+  'end',
+  'local coverageModel = redis.call("get", KEYS[4])',
+  'if (coverageRaw == false) ~= (coverageModel == false) then coverageState = -1 end',
+  'return {dayUsed, monthUsed, coverageHeld, coverageState, coverageModel or ""}',
+].join('\n');
+
+// The proxy rolls out independently from its callers. Keep the immediately
+// prior read and reserve scripts pinned until every caller runs the new model.
+const LEGACY_X_POST_BUDGET_RESERVE_SCRIPT = [
+  'local requested = tonumber(ARGV[1])',
+  'local coverageTotal = tonumber(ARGV[2]) or 0',
+  'local dailyLimit = tonumber(ARGV[3])',
+  'local monthlyLimit = tonumber(ARGV[4])',
+  'local coverageUnit = tonumber(ARGV[9]) or 0',
+  'local hasCoverageUnit = ARGV[10] == "1"',
+  'local hasReceipt = ARGV[11] == "1"',
+  'local coverageModel = ARGV[12] or ""',
+  'local deadlineMs = tonumber(ARGV[13]) or 0',
+  'local dayUsed = tonumber(redis.call("get", KEYS[1]) or "0")',
+  'local monthUsed = tonumber(redis.call("get", KEYS[2]) or "0")',
+  'local coverageRaw = redis.call("get", KEYS[5])',
+  'local coverageHeld = tonumber(coverageRaw or "0") or 0',
+  'local coverageModelRaw = redis.call("get", KEYS[9])',
+  'if hasReceipt then',
+  '  local pendingReceipt = redis.call("get", KEYS[7])',
+  '  if pendingReceipt ~= false then return {0, dayUsed, monthUsed, 4, coverageHeld, pendingReceipt} end',
+  '  if redis.call("exists", KEYS[8]) == 1 then return {0, dayUsed, monthUsed, 5, coverageHeld, ""} end',
+  'end',
+  'if deadlineMs > 0 then',
+  '  local serverTime = redis.call("time")',
+  '  local serverNowMs = (tonumber(serverTime[1]) * 1000) + math.floor(tonumber(serverTime[2]) / 1000)',
+  '  if serverNowMs >= deadlineMs then return {0, dayUsed, monthUsed, 7, coverageHeld, ""} end',
+  'end',
+  'if coverageRaw == false and coverageTotal > 0 then',
+  '  coverageHeld = coverageTotal',
+  '  redis.call("set", KEYS[5], coverageHeld, "EXAT", tonumber(ARGV[5]))',
+  '  redis.call("set", KEYS[9], coverageModel, "EXAT", tonumber(ARGV[5]))',
+  'end',
+  'if hasCoverageUnit and coverageModelRaw ~= false and coverageModelRaw ~= coverageModel then return {0, dayUsed, monthUsed, 6, coverageHeld, ""} end',
+  'if hasCoverageUnit and coverageRaw ~= false and coverageModelRaw == false then return {0, dayUsed, monthUsed, 6, coverageHeld, ""} end',
+  'local coverageAccounted = hasCoverageUnit and redis.call("exists", KEYS[6]) == 1',
+  'if coverageAccounted then return {0, dayUsed, monthUsed, 3, coverageHeld, ""} end',
+  'local coverageAfter = coverageHeld',
+  'if hasCoverageUnit then coverageAfter = math.max(0, coverageHeld - coverageUnit) end',
+  'local oncePerDay = ARGV[8] == "1"',
+  'if oncePerDay and redis.call("exists", KEYS[4]) == 1 then return {0, dayUsed, monthUsed, 3, coverageHeld} end',
+  'if dayUsed + requested + coverageAfter > dailyLimit then return {0, dayUsed, monthUsed, 1, coverageHeld} end',
+  'if monthUsed + requested + coverageAfter > monthlyLimit then return {0, dayUsed, monthUsed, 2, coverageHeld} end',
+  'dayUsed = redis.call("incrby", KEYS[1], requested)',
+  'monthUsed = redis.call("incrby", KEYS[2], requested)',
+  'redis.call("expireat", KEYS[1], tonumber(ARGV[5]))',
+  'redis.call("expireat", KEYS[2], tonumber(ARGV[6]))',
+  'if hasCoverageUnit then',
+  '  redis.call("set", KEYS[5], coverageAfter, "EXAT", tonumber(ARGV[5]))',
+  '  redis.call("set", KEYS[6], "1", "EXAT", tonumber(ARGV[5]))',
+  'end',
+  'redis.call("set", KEYS[3], requested, "EX", tonumber(ARGV[7]))',
+  'if hasReceipt then redis.call("set", KEYS[8], KEYS[3], "EX", tonumber(ARGV[7])) end',
+  'if oncePerDay then redis.call("set", KEYS[4], "done", "EXAT", tonumber(ARGV[5])) end',
+  'return {1, dayUsed, monthUsed, 0, coverageAfter, ""}',
+].join('\n');
+
+const LEGACY_X_POST_BUDGET_STATUS_SCRIPT = [
+  'local dayUsed = tonumber(redis.call("get", KEYS[1]) or "0")',
+  'local monthUsed = tonumber(redis.call("get", KEYS[2]) or "0")',
+  'local coverageRaw = redis.call("get", KEYS[3])',
+  'local coverageHeld = tonumber(coverageRaw or "0") or 0',
+  'local coverageModel = redis.call("get", KEYS[4])',
+  'return {dayUsed, monthUsed, coverageHeld, coverageRaw == false and 0 or 1, coverageModel or ""}',
 ].join('\n');
 
 // PINNED COPY of scripts/seed-physical-premiums.mjs APPEND_HISTORY_LUA.
@@ -410,7 +516,26 @@ const PHYSICAL_DIVERGENCE_PUBLISH_SCRIPT = [
   'end',
   'return #KEYS',
 ].join('\n');
+const SOURCE_RETRY_CLAIM_SCRIPT = [
+  "if redis.call('GET', KEYS[1]) ~= ARGV[1] then return 0 end",
+  "redis.call('SET', KEYS[1], ARGV[2], 'XX', 'KEEPTTL')",
+  'return 1',
+].join('\n');
+// Pinned copy of shared/cable-health-repair-script.mjs; command-parity tests check exact bytes.
+const CABLE_HEALTH_REPAIR_SCRIPT = [
+  "if redis.call('GET', KEYS[1]) ~= ARGV[1] then return 0 end",
+  "local clock = redis.call('TIME')",
+  'local now = tonumber(clock[1]) * 1000.0 + tonumber(clock[2]) / 1000',
+  'if tonumber(ARGV[2]) <= now then return 0 end',
+  "redis.call('PEXPIREAT', KEYS[1], ARGV[2])",
+  "if redis.call('GET', KEYS[2]) ~= ARGV[3] then",
+  "  redis.call('SET', KEYS[2], ARGV[3], 'EX', 604800)",
+  'end',
+  'return 1',
+].join('\n');
 const ALLOWED_EVAL_SCRIPTS = new Set([
+  CABLE_HEALTH_REPAIR_SCRIPT,
+  SOURCE_RETRY_CLAIM_SCRIPT,
   DIGEST_LASTGOOD_PUBLISH_SCRIPT,
   STORY_ALIAS_PUBLISH_SCRIPT,
   MCP_QUOTA_RESERVE_SCRIPT,
@@ -418,9 +543,15 @@ const ALLOWED_EVAL_SCRIPTS = new Set([
   X_POST_BUDGET_SETTLE_SCRIPT,
   X_POST_BUDGET_ACK_RECEIPTS_SCRIPT,
   X_POST_BUDGET_STATUS_SCRIPT,
+  LEGACY_X_POST_BUDGET_RESERVE_SCRIPT,
+  LEGACY_X_POST_BUDGET_STATUS_SCRIPT,
   PHYSICAL_PREMIUM_HISTORY_APPEND_SCRIPT,
   PHYSICAL_PREMIUM_PUBLISH_SCRIPT,
   PHYSICAL_DIVERGENCE_PUBLISH_SCRIPT,
+]);
+const LEGACY_EVAL_REPLACEMENTS = new Map([
+  [LEGACY_X_POST_BUDGET_RESERVE_SCRIPT, X_POST_BUDGET_RESERVE_SCRIPT],
+  [LEGACY_X_POST_BUDGET_STATUS_SCRIPT, X_POST_BUDGET_STATUS_SCRIPT],
 ]);
 
 // Exact-text pin, not a pattern: any change to the script — including
@@ -455,10 +586,17 @@ function assertCommandAllowed(args) {
   return cmd;
 }
 
-async function runCommand(args) {
+function commandForExecution(args) {
   const cmd = assertCommandAllowed(args);
-  const cmdArgs = args.slice(1);
-  return client.sendCommand([cmd, ...cmdArgs.map(String)]);
+  const command = [cmd, ...args.slice(1).map(String)];
+  if (cmd === 'EVAL') {
+    command[1] = LEGACY_EVAL_REPLACEMENTS.get(command[1]) || command[1];
+  }
+  return command;
+}
+
+async function runCommand(args) {
+  return client.sendCommand(commandForExecution(args));
 }
 
 // Every seeder that publishes through atomicPublish (scripts/_seed-utils.mjs) is
@@ -672,13 +810,12 @@ const server = http.createServer(async (req, res) => {
       const multi = client.multi();
       for (const cmd of commands) {
         try {
-          assertCommandAllowed(cmd);
+          multi.sendCommand(commandForExecution(cmd));
         } catch (err) {
           res.writeHead(403);
           res.end(JSON.stringify({ error: err.message }));
           return;
         }
-        multi.sendCommand(cmd.map(String));
       }
       const results = await multi.exec();
       res.writeHead(200);

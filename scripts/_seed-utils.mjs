@@ -1090,10 +1090,8 @@ export function resolveSeedMetaTtl(metaTtlSeconds, dataTtlSeconds) {
   return metaTtlSeconds ?? Math.max(SEED_META_MIN_TTL_SECONDS, dataTtlSeconds || 0);
 }
 
-export async function writeSeedMeta(dataKey, recordCount, metaKeyOverride, metaTtlSeconds, coverage, extra) {
-  const { url, token } = getRedisCredentials();
-  const metaKey = metaKeyOverride || `seed-meta:${dataKey.replace(/:v\d+$/, '')}`;
-  const meta = { fetchedAt: Date.now(), recordCount: recordCount ?? 0 };
+function buildSeedMeta(recordCount, coverage, extra, fetchedAt = Date.now()) {
+  const meta = { fetchedAt, recordCount: recordCount ?? 0 };
   if (coverage) meta.coverage = coverage;
   // Optional producer diagnostics, copied verbatim onto the meta record.
   // api/health.js decides which fields it trusts (see readSeedMeta), so callers
@@ -1105,6 +1103,13 @@ export async function writeSeedMeta(dataKey, recordCount, metaKeyOverride, metaT
       if (value !== undefined) meta[key] = value;
     }
   }
+  return meta;
+}
+
+export async function writeSeedMeta(dataKey, recordCount, metaKeyOverride, metaTtlSeconds, coverage, extra) {
+  const { url, token } = getRedisCredentials();
+  const metaKey = metaKeyOverride || `seed-meta:${dataKey.replace(/:v\d+$/, '')}`;
+  const meta = buildSeedMeta(recordCount, coverage, extra);
   // No data TTL is in scope here — callers that know one resolve it through
   // `resolveSeedMetaTtl` before calling. Bare floor otherwise.
   const metaTtl = resolveSeedMetaTtl(metaTtlSeconds);
@@ -1125,12 +1130,87 @@ export async function writeSeedMeta(dataKey, recordCount, metaKeyOverride, metaT
   return true;
 }
 
-export async function writeExtraKeyWithMeta(key, data, ttl, recordCount, metaKeyOverride, metaTtlSeconds, coverage) {
+export async function writeExtraKeyWithMeta(key, data, ttl, recordCount, metaKeyOverride, metaTtlSeconds, coverage, extra) {
   await writeExtraKey(key, data, ttl);
   // The data TTL is right here, so the meta never has to be the shorter of the
   // two. seed-economy's four EIA weekly keys (21d data, 14d health budget) rode
   // the bare 7d default and went silent-OK for the 14 days in between.
-  return writeSeedMeta(key, recordCount, metaKeyOverride, resolveSeedMetaTtl(metaTtlSeconds, ttl), coverage);
+  // `extra` carries the same optional producer diagnostics writeSeedMeta accepts
+  // directly (see its contract note) — provenance a caller needs on the meta
+  // record, not just inside the data payload.
+  return writeSeedMeta(key, recordCount, metaKeyOverride, resolveSeedMetaTtl(metaTtlSeconds, ttl), coverage, extra);
+}
+
+// Some aggregate keys are both the data pointer and the provenance source for
+// health. Publish that pair in one Redis transaction so readers cannot observe
+// a new marker with the previous seed-meta record.
+export async function writeExtraKeyWithMetaAtomically({
+  key,
+  data,
+  ttlSeconds,
+  recordCount,
+  metaKey: metaKeyOverride,
+  metaTtlSeconds,
+  coverage,
+  extra,
+  fetchedAt = Date.now(),
+}) {
+  const { url, token } = getRedisCredentials();
+  const dataTtl = Number(ttlSeconds);
+  const metaTtl = Number(resolveSeedMetaTtl(metaTtlSeconds, dataTtl));
+  if (!key || !Number.isInteger(dataTtl) || dataTtl <= 0) {
+    throw new Error('Atomic extra-key publish requires a key and a positive integer TTL');
+  }
+  if (!Number.isInteger(metaTtl) || metaTtl <= 0) {
+    throw new Error('Atomic seed-meta publish requires a positive integer TTL');
+  }
+
+  const metaKey = metaKeyOverride || `seed-meta:${key.replace(/:v\d+$/, '')}`;
+  const commands = [
+    ['SET', key, JSON.stringify(data), 'EX', dataTtl],
+    ['SET', metaKey, JSON.stringify(buildSeedMeta(recordCount, coverage, extra, fetchedAt)), 'EX', metaTtl],
+  ];
+  // This runs after the provider fetches have settled. Retrying this bounded
+  // Redis transaction therefore recovers a transient publication failure
+  // without replaying the provider requests or exposing half the pair.
+  return withRetry(async () => {
+    const resp = await fetch(`${url}/multi-exec`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json', 'User-Agent': CHROME_UA },
+      body: JSON.stringify(commands),
+      signal: AbortSignal.timeout(5_000),
+    });
+    if (!resp.ok) {
+      const err = httpRetryError(resp);
+      err.message = `Atomic extra-key publish failed: HTTP ${resp.status}`;
+      err.httpStatus = resp.status;
+      throw err;
+    }
+
+    let results;
+    try {
+      results = await resp.json();
+    } catch (cause) {
+      throw Object.assign(new Error('Atomic extra-key publish failed: invalid transaction response'), {
+        cause,
+        nonRetryable: true,
+      });
+    }
+    if (!Array.isArray(results)) {
+      throw Object.assign(
+        new Error(`Atomic extra-key publish failed: ${results?.error || 'invalid transaction response'}`),
+        { nonRetryable: true },
+      );
+    }
+    const failures = results.filter((result) => result?.error || result?.result === 'ERR');
+    if (failures.length > 0 || results.length !== commands.length) {
+      throw Object.assign(
+        new Error(`Atomic extra-key publish failed: ${failures.length || 'missing'} command result(s)`),
+        { nonRetryable: true },
+      );
+    }
+    return true;
+  }, SEED_REDIS_RETRY_ATTEMPTS - 1, SEED_REDIS_RETRY_BASE_MS);
 }
 
 // Detailed counterpart to extendExistingTtl. Results stay aligned to the input
@@ -2010,16 +2090,42 @@ export function roundGeoCoordinate(value, decimals = GEO_COORDINATE_DECIMALS) {
   return Number.isFinite(value) ? Number(value.toFixed(decimals)) : value;
 }
 
+/**
+ * A measured observation from an upstream feed, or null when there isn't one.
+ *
+ * Statistical and market APIs spell "suppressed", "not yet released" and "no
+ * quote" as null, '' or false. Number() turns all three into 0, and 0 is a
+ * publishable measurement, so a bare Number() converts missing data into a
+ * confident reading of zero. Numeric strings stay valid because several feeds
+ * quote their values.
+ */
+export function finiteObservation(value) {
+  if (typeof value !== 'number' && (typeof value !== 'string' || !value.trim())) return null;
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+
 export function parseYahooChart(data, symbol) {
   const result = data?.chart?.result?.[0];
   const meta = result?.meta;
   if (!meta) return null;
 
-  const price = meta.regularMarketPrice;
-  const prevClose = meta.chartPreviousClose || meta.previousClose || price;
+  // A quote with no price is not a quote. Publishing it produced a market row
+  // carrying an undefined price and a change of exactly 0.00%.
+  const price = finiteObservation(meta.regularMarketPrice);
+  if (price == null) return null;
+  // A zero previous close makes the percentage change infinite, so it is
+  // treated as unusable here exactly as the previous `||` chain did.
+  const prevClose = [meta.chartPreviousClose, meta.previousClose]
+    .map(finiteObservation)
+    .find(value => value != null && value !== 0) ?? price;
   const change = prevClose ? ((price - prevClose) / prevClose) * 100 : 0;
   const closes = result.indicators?.quote?.[0]?.close;
-  const sparkline = roundSparkline(Array.isArray(closes) ? closes.filter((v) => v != null) : []);
+  // NaN survives a != null filter and serializes as null in the published
+  // sparkline, leaving a hole in the chart rather than a shorter series.
+  const sparkline = roundSparkline(
+    Array.isArray(closes) ? closes.map(finiteObservation).filter(v => v != null) : [],
+  );
 
   return { symbol, name: symbol, display: symbol, price, change: +change.toFixed(2), sparkline };
 }
@@ -2613,13 +2719,15 @@ export async function runSeed(domain, resource, canonicalKey, fetchFn, opts = {}
         // from the previous seed-meta write. The SET below replaces the whole
         // key; without this merge a validate-skip after a healthy publish wipes
         // afterPublish patches and fail-closed consumers false-alarm.
+        const currentSkipDiagnostics =
+          freshnessMetaDiagnosticsPatch(validationSkipResult?.freshnessMetaPatch) || {};
         const preservedDiagnostics = {
           ...(freshnessMetaDiagnosticsPatch(
             validationSkipMetaRead
               ? validationSkipExistingMeta
               : await readExistingSeedMeta(domain, resource),
           ) || {}),
-          ...(freshnessMetaDiagnosticsPatch(validationSkipResult?.freshnessMetaPatch) || {}),
+          ...currentSkipDiagnostics,
         };
         if (canonicalMeta) {
           // Pass-through canonical's contentAge so health doesn't lose the
@@ -2640,9 +2748,15 @@ export async function runSeed(domain, resource, canonicalKey, fetchFn, opts = {}
             `existing cache TTL extended`,
           );
         } else {
-          // No last-good envelope: quiet-period zero write. Drop prior
-          // diagnostics — they described a different cohort and would lie.
-          await writeFreshnessMetadataSafely(domain, resource, 0, opts.sourceVersion, ttlSeconds);
+          // No non-empty last-good envelope: drop prior diagnostics because
+          // they described a different cohort, but retain diagnostics emitted
+          // by this rejected attempt. A valid zero-record predecessor can
+          // still carry bounded source-failure evidence.
+          await writeFreshnessMetadataSafely(
+            domain, resource, 0, opts.sourceVersion, ttlSeconds,
+            undefined, undefined,
+            Object.keys(currentSkipDiagnostics).length > 0 ? currentSkipDiagnostics : null,
+          );
           console.log(`  SKIPPED: validation failed (empty data) — seed-meta refreshed (recordCount=0), existing cache TTL extended`);
         }
       }

@@ -4,6 +4,10 @@
     "deployMode": "dockerfile",
     "dockerfile": "Dockerfile.relay",
     "service": "ais-relay",
+    "requiredEnv": [
+      "X_BEARER_TOKEN",
+      "X_CURATED_LIST_ID"
+    ],
     "watchPatterns": [
       ".dockerignore",
       "Dockerfile.relay",
@@ -23,12 +27,14 @@
       "scripts/_seed-utils.mjs",
       "scripts/_wb-tech-readiness-projection.cjs",
       "scripts/_weather-alert-select.mjs",
+      "scripts/_widget-response-parser.cjs",
       "scripts/_yahoo-sector-valuations.cjs",
       "scripts/ais-relay.cjs",
       "scripts/docs-stats.mjs",
       "scripts/generate-inventory-facts.mjs",
       "scripts/lib/classify-digest-request.cjs",
       "scripts/lib/digest-stale-gate.cjs",
+      "scripts/lib/geo-coord.mjs",
       "scripts/lib/llm-model-policy.cjs",
       "scripts/lib/llm-telemetry.cjs",
       "scripts/lib/poll-generation-guard.cjs",
@@ -408,12 +414,15 @@
       "scripts/lib/bc-emergency-info.mjs",
       "scripts/lib/canada-alerts-union.mjs",
       "scripts/lib/saskalert.mjs",
+      "scripts/lib/geo-coord.mjs",
       "scripts/lib/gtfsrt.mjs",
       "scripts/lib/llm-telemetry.cjs",
       "scripts/lib/open511.mjs",
       "scripts/lib/provincial-511.mjs",
       "scripts/lib/toronto-official-cad.mjs",
       "scripts/lib/toronto-road-restrictions.mjs",
+      "scripts/lib/tps-open-data.mjs",
+      "scripts/lib/tps-seed-runner.mjs",
       "scripts/nixpacks.toml",
       "scripts/package-lock.json",
       "scripts/package.json",
@@ -426,8 +435,11 @@
       "scripts/seed-toronto-road-restrictions.mjs",
       "scripts/seed-toronto-tfs.mjs",
       "scripts/seed-toronto-tps.mjs",
+      "scripts/seed-tps-calls-attended.mjs",
+      "scripts/seed-tps-mci.mjs",
       "scripts/seed-ttc-alerts.mjs",
       "scripts/seed-viarail-live.mjs",
+      "scripts/shared/toronto-safety.mjs",
       "scripts/viarail-live.mjs"
     ],
     "cronSchedule": "*/5 * * * *",
@@ -660,6 +672,7 @@
       "scripts/_eurostat-utils.mjs",
       "scripts/_html-entities.mjs",
       "scripts/_imf-weo-content-age-helpers.mjs",
+      "scripts/_macro-bundle-order.mjs",
       "scripts/_proxy-utils.cjs",
       "scripts/_seed-contract.mjs",
       "scripts/_seed-envelope-source.mjs",
@@ -711,6 +724,7 @@
       "scripts/shared/sovereign-status.json",
       "shared/iso2-to-iso3.json"
     ],
+    "cronSchedule": "0 8,9 * * *",
     "documentedAt": "docs/railway-seed-consolidation-runbook.md#bundle-8-seed-bundle-macro"
   },
   {
@@ -1178,6 +1192,7 @@
       "scripts/_conflict-hapi.mjs",
       "scripts/_country-resolver.mjs",
       "scripts/_gdelt-bulk-contract.mjs",
+      "scripts/_gdelt-country-codes.mjs",
       "scripts/_gdelt-fetch.mjs",
       "scripts/_proxy-utils.cjs",
       "scripts/_seed-contract.mjs",
@@ -1194,10 +1209,12 @@
       "scripts/package.json",
       "scripts/seed-conflict-intel.mjs",
       "scripts/shared/country-names.json",
+      "scripts/shared/crawlable-crises.json",
       "scripts/shared/hapi-app-identifier.json",
       "scripts/shared/iso2-to-iso3.json",
       "scripts/shared/iso3-to-iso2.json",
       "shared/country-names.json",
+      "shared/crawlable-crises.json",
       "shared/hapi-app-identifier.json",
       "shared/iso2-to-iso3.json",
       "shared/iso3-to-iso2.json"
@@ -1263,6 +1280,7 @@
       "UPSTASH_REDIS_REST_TOKEN"
     ],
     "watchPatterns": [
+      "scripts/_html-entities.mjs",
       "scripts/_proxy-utils.cjs",
       "scripts/_seed-contract.mjs",
       "scripts/_seed-envelope-source.mjs",
@@ -1274,7 +1292,8 @@
       "scripts/package.json",
       "scripts/seed-fire-detections.mjs",
       "scripts/wildfire/bc-fire-points.mjs",
-      "scripts/wildfire/cwfis-wfs.mjs"
+      "scripts/wildfire/cwfis-wfs.mjs",
+      "scripts/wildfire/firms-area.mjs"
     ],
     "cronSchedule": "*/10 * * * *",
     "documentedAt": "docs/railway-seed-consolidation-runbook.md#standalone-seed-crons-43-not-bundled"
@@ -1418,11 +1437,13 @@
       "scripts/_conflict-gdelt.mjs",
       "scripts/_gdelt-bulk-contract.mjs",
       "scripts/_gdelt-bulk-materializer.mjs",
+      "scripts/_gdelt-country-codes.mjs",
       "scripts/_html-entities.mjs",
       "scripts/_proxy-utils.cjs",
       "scripts/_seed-contract.mjs",
       "scripts/_seed-envelope-source.mjs",
       "scripts/_seed-utils.mjs",
+      "scripts/_upstash-rest.mjs",
       "scripts/lib/llm-telemetry.cjs",
       "scripts/seed-gdelt-bulk-materializer.mjs",
       "scripts/package.json",
@@ -1454,6 +1475,7 @@
       "scripts/seed-insights.mjs",
       "scripts/shared/brief-llm-core.js",
       "scripts/shared/country-names.json",
+      "scripts/shared/digest-acceptance.mjs",
       "scripts/shared/diplomacy-keywords.json",
       "scripts/shared/geo-extract.mjs",
       "scripts/shared/publisher-families.js",
@@ -1466,11 +1488,13 @@
     "entry": "scripts/seed-market-breadth.mjs",
     "deployMode": "nixpacks-root-scripts",
     "service": "seed-market-breadth",
+    "cronSchedule": "0 2,8 * * *",
     "watchPatterns": [
       "scripts/_proxy-utils.cjs",
       "scripts/_seed-contract.mjs",
       "scripts/_seed-envelope-source.mjs",
       "scripts/_seed-utils.mjs",
+      "scripts/_sp500-breadth.mjs",
       "scripts/lib/llm-telemetry.cjs",
       "scripts/nixpacks.toml",
       "scripts/package-lock.json",
@@ -1532,6 +1556,33 @@
     "documentedAt": "docs/railway-seed-consolidation-runbook.md#standalone-seed-crons-43-not-bundled"
   },
   {
+    "entry": "scripts/seed-security-advisories.mjs",
+    "deployMode": "nixpacks-root-scripts",
+    "service": "seed-security-advisories",
+    "requiredEnv": [
+      "UPSTASH_REDIS_REST_URL",
+      "UPSTASH_REDIS_REST_TOKEN"
+    ],
+    "watchPatterns": [
+      "scripts/_html-entities.mjs",
+      "scripts/_proxy-utils.cjs",
+      "scripts/_seed-contract.mjs",
+      "scripts/_seed-envelope-source.mjs",
+      "scripts/_seed-utils.mjs",
+      "scripts/lib/llm-telemetry.cjs",
+      "scripts/nixpacks.toml",
+      "scripts/package-lock.json",
+      "scripts/package.json",
+      "scripts/seed-security-advisories.mjs",
+      "scripts/shared/country-names.json",
+      "scripts/shared/rss-allowed-domains.json",
+      "shared/country-names.json",
+      "shared/rss-allowed-domains.json"
+    ],
+    "cronSchedule": "0 * * * *",
+    "documentedAt": "scripts/seed-security-advisories.mjs"
+  },
+  {
     "entry": "scripts/seed-service-statuses.mjs",
     "deployMode": "nixpacks-root-repo",
     "lifecycle": "planned",
@@ -1568,9 +1619,31 @@
   },
   {
     "entry": "scripts/seed-imd-cyclone-marine.mjs",
-    "deployMode": "nixpacks-root-repo",
-    "lifecycle": "planned",
+    "deployMode": "nixpacks-root-scripts",
     "service": "seed-imd-cyclone-marine",
+    "startCommand": "node seed-imd-cyclone-marine.mjs",
+    "requiredEnv": [
+      "IMD_API_KEY",
+      "IMD_API_EMAIL",
+      "IMD_API_PASSWORD",
+      "PROXY_URL",
+      "UPSTASH_REDIS_REST_URL",
+      "UPSTASH_REDIS_REST_TOKEN"
+    ],
+    "watchPatterns": [
+      "scripts/_proxy-utils.cjs",
+      "scripts/_seed-contract.mjs",
+      "scripts/_seed-envelope-source.mjs",
+      "scripts/_seed-utils.mjs",
+      "scripts/_upstash-rest.mjs",
+      "scripts/lib/imd-cyclone-marine.mjs",
+      "scripts/lib/llm-telemetry.cjs",
+      "scripts/nixpacks.toml",
+      "scripts/package-lock.json",
+      "scripts/package.json",
+      "scripts/seed-imd-cyclone-marine.mjs"
+    ],
+    "cronSchedule": "*/15 * * * *",
     "documentedAt": "docs/railway-seed-consolidation-runbook.md#standalone-seed-crons-added-after-this-snapshot"
   },
   {

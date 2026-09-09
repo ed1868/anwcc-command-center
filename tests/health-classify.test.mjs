@@ -31,10 +31,107 @@ const {
   ZERO_RECORD_DATA_OK_KEYS,
   EMPTY_DATA_OK_KEYS,
   projectChinaCoverageStatus,
+  composeChinaDecisionSignalsStatus,
 } = __testing__;
 
 const NOW = 1_700_000_000_000;
 const ONE_MIN_MS = 60_000;
+
+test('MND first-failure pending requires fresh last-good and expires without another poll', () => {
+  const name = 'crossStraitActivityTaiwanMnd';
+  const key = STANDALONE_KEYS[name];
+  const meta = {
+    fetchedAt: NOW - ONE_MIN_MS,
+    recordCount: 133,
+    sourceState: 'degraded',
+    errorCode: 'MND_PUBLICATION_METADATA_MISSING',
+    consecutiveSourceFailures: 1,
+    lastSourceFailureCode: 'MND_PUBLICATION_METADATA_MISSING',
+    firstSourceFailureAt: NOW,
+    lastSourceAttemptAt: NOW,
+  };
+  const classify = (over = {}, now = NOW, bytes = 1024) => classifyKey(name, key, { allowOnDemand: false }, {
+    ...makeCtx({ strens: { [key]: bytes }, metaValues: { [SEED_META[name].key]: { ...meta, ...over } } }),
+    now,
+  });
+  const entry = classify();
+  assert.equal(entry.status, 'SEED_ERROR', 'retain the source diagnosis');
+  assert.equal(entry.sourceFailurePendingUntil, new Date(NOW + 210 * ONE_MIN_MS).toISOString());
+  assert.equal(__testing__.healthStatusBucket(entry, NOW), 'ok');
+  assert.deepEqual(classify(), entry, 'another health poll is not another failed source attempt');
+  const compact = healthResponseBody({ status: 'HEALTHY', summary: { pending: 1 }, checkedAt: new Date(NOW).toISOString(), checks: { [name]: entry } }, true);
+  assert.deepEqual(compact.pending, { [name]: entry });
+  assert.equal(compact.problems, undefined);
+  const deadline = NOW + 210 * ONE_MIN_MS;
+  assert.equal(__testing__.healthStatusBucket(entry, deadline), 'warn');
+  assert.equal(classify({}, deadline).sourceFailurePendingUntil, undefined);
+  assert.equal(__testing__.hasExpiredActivationGrace(compact, deadline), true);
+  assert.equal(__testing__.snapshotTtlSeconds(compact, deadline - 20_000), 20);
+  for (const over of [
+    { consecutiveSourceFailures: 2 }, { consecutiveSourceFailures: null },
+    { firstSourceFailureAt: null }, { firstSourceFailureAt: NOW + 1 },
+    { lastSourceAttemptAt: NOW + 1 }, { lastSourceAttemptAt: null },
+    { lastSourceFailureCode: 'MND_SOURCE_ERROR' },
+    { fetchedAt: NOW - 721 * ONE_MIN_MS }, { fetchedAt: NOW + 1 }, { fetchedAt: 0 },
+    { recordCount: 0 }, { recordCount: null }, { sourceState: 'error' },
+    { maxContentAgeMin: 60, newestItemAt: NOW - 120 * ONE_MIN_MS },
+  ]) {
+    const failed = classify(over);
+    assert.equal(failed.sourceFailurePendingUntil, undefined, JSON.stringify(over));
+    assert.notEqual(__testing__.healthStatusBucket(failed, NOW), 'ok', JSON.stringify(over));
+  }
+  assert.equal(classify({}, NOW, 0).status, 'EMPTY');
+  assert.equal(classify({}, NOW, 0).sourceFailurePendingUntil, undefined);
+  const nearStale = classify({ fetchedAt: NOW - 719 * ONE_MIN_MS });
+  assert.equal(nearStale.sourceFailurePendingUntil, new Date(NOW + ONE_MIN_MS).toISOString());
+});
+
+test('NHC first-failure pending is bounded by its original complete snapshot', () => {
+  const name = 'naturalEvents';
+  const key = BOOTSTRAP_KEYS[name];
+  const meta = {
+    fetchedAt: NOW,
+    recordCount: 2,
+    sourceState: 'degraded',
+    errorCode: 'NHC_POINT_REQUEST_FAILED',
+    consecutiveSourceFailures: 1,
+    lastSourceFailureCode: 'NHC_POINT_REQUEST_FAILED',
+    firstSourceFailureAt: NOW,
+    lastSourceAttemptAt: NOW,
+    lastSourceSuccessAt: NOW - 539 * ONE_MIN_MS,
+  };
+  const classify = (over = {}, now = NOW) => classifyKey(name, key, { allowOnDemand: false }, {
+    ...makeCtx({ strens: { [key]: 1024 }, metaValues: { [SEED_META[name].key]: { ...meta, ...over } } }),
+    now,
+  });
+
+  const entry = classify();
+  assert.equal(entry.status, 'SEED_ERROR');
+  assert.equal(entry.sourceFailurePendingUntil, new Date(NOW + ONE_MIN_MS).toISOString());
+  assert.equal(__testing__.healthStatusBucket(entry, NOW), 'ok');
+  for (const over of [
+    { consecutiveSourceFailures: 2 },
+    { recordCount: 0 },
+    { lastSourceSuccessAt: null },
+    { lastSourceSuccessAt: NOW + 1 },
+    { firstSourceFailureAt: null },
+    { errorCode: 'NHC_UNRECOGNIZED_FAILURE', lastSourceFailureCode: 'NHC_UNRECOGNIZED_FAILURE' },
+  ]) {
+    const failed = classify(over);
+    assert.equal(failed.sourceFailurePendingUntil, undefined, JSON.stringify(over));
+    assert.notEqual(__testing__.healthStatusBucket(failed, NOW), 'ok', JSON.stringify(over));
+  }
+});
+
+test('natural events accepts a published complete empty aggregate but not a missing key', () => {
+  const name = 'naturalEvents';
+  const key = BOOTSTRAP_KEYS[name];
+  const metaValues = { [SEED_META[name].key]: { fetchedAt: NOW, recordCount: 0, sourceState: 'ok' } };
+  const present = classifyKey(name, key, { allowOnDemand: false }, makeCtx({ strens: { [key]: 100 }, metaValues }));
+  const missing = classifyKey(name, key, { allowOnDemand: false }, makeCtx({ strens: { [key]: 0 }, metaValues }));
+  assert.equal(present.status, 'OK');
+  assert.equal(missing.status, 'EMPTY');
+});
 
 // Build the same ctx shape the handler constructs: four Maps + now.
 //   strens:     { redisDataKey -> byteLen }
@@ -1580,7 +1677,7 @@ test('classifyKey: a permanently blocked humanitarian provider surfaces as SEED_
       metaValues: {
         [metaKey]: seedMeta({
           status: 'error',
-          errorReason: 'HAPI_HDX_SNAPSHOT_FALLBACK_FAILED',
+          errorReason: 'HAPI_BOT_BLOCK',
         }),
       },
     }));
@@ -1738,6 +1835,30 @@ test('issue #6125: a fresh zero-surge snapshot is healthy, but a stale one still
   }));
   assert.equal(stale.status, 'STALE_SEED');
   assert.equal(stale.records, 0);
+});
+
+test('xFeed accepts a fresh explicit-zero List page but keeps a missing snapshot strict', () => {
+  const name = 'xFeed';
+  const dataKey = STANDALONE_KEYS[name];
+  const metaKey = SEED_META[name].key;
+
+  assert.equal(ZERO_RECORD_DATA_OK_KEYS.has(name), true);
+  assert.equal(classifyKey(name, dataKey, { allowOnDemand: false }, makeCtx()).status, 'EMPTY');
+
+  const fresh = classifyKey(name, dataKey, { allowOnDemand: false }, makeCtx({
+    strens: { [dataKey]: 128 },
+    metaValues: { [metaKey]: seedMeta({ recordCount: 0 }) },
+  }));
+  assert.equal(fresh.status, 'OK');
+
+  const stale = classifyKey(name, dataKey, { allowOnDemand: false }, makeCtx({
+    strens: { [dataKey]: 128 },
+    metaValues: { [metaKey]: seedMeta({
+      recordCount: 0,
+      fetchedAt: NOW - 46 * ONE_MIN_MS,
+    }) },
+  }));
+  assert.equal(stale.status, 'STALE_SEED');
 });
 
 test('HKO warning snapshots are classified through their matching seed-meta key', () => {
@@ -2179,8 +2300,10 @@ test('#6987 — the two aviation probes no longer share a meta key', () => {
 // A summary that is degraded for ONE hourly evaluation is far more often a
 // sampling miss than an outage — measured 2026-08-25, a two-minute miss on
 // market.china-stock-connect cost ~50 minutes of CHINA_DEGRADED while 13 of the
-// surrounding 16 monitor runs were clean. Requiring a second consecutive
-// observation trades one cycle of detection latency for that.
+// surrounding 16 monitor runs were clean. A three-hour validity window avoids
+// turning those brief sampling misses into fleet warnings.
+const CHINA_SUMMARY_AT = Date.parse('2026-08-25T17:03:23.563Z');
+const CHINA_LAST_HEALTHY_AT = CHINA_SUMMARY_AT - 3 * ONE_MIN_MS;
 const chinaSummary = (over = {}) => ({
   schemaVersion: 1,
   countryCode: 'CN',
@@ -2201,38 +2324,76 @@ const chinaSummary = (over = {}) => ({
     status: 'degraded',
     reasonCodes: ['CHINA_COVERAGE_PARTIAL'],
   }]),
+  lastHealthyAt: CHINA_LAST_HEALTHY_AT,
   ...over,
 });
 
-test('china coverage: a single degraded evaluation does not alarm', () => {
-  const projected = projectChinaCoverageStatus(chinaSummary({ degradedStreak: 1 }));
-  assert.equal(projected.status, 'OK');
-});
-
-test('china coverage: a second consecutive degraded evaluation alarms', () => {
-  const projected = projectChinaCoverageStatus(chinaSummary({ degradedStreak: 2 }));
+test('china coverage: a recent degraded evaluation stays pending for three hours', () => {
+  const projected = projectChinaCoverageStatus(
+    chinaSummary({ degradedStreak: 1 }),
+    false,
+    CHINA_SUMMARY_AT + ONE_MIN_MS,
+  );
   assert.equal(projected.status, 'CHINA_DEGRADED');
+  assert.equal(
+    projected.chinaCoveragePendingUntil,
+    new Date(CHINA_LAST_HEALTHY_AT + 3 * 60 * ONE_MIN_MS).toISOString(),
+  );
+  assert.equal(__testing__.healthStatusBucket(projected, CHINA_SUMMARY_AT + ONE_MIN_MS), 'ok');
 });
 
-test('china coverage: nonpositive streaks cannot suppress a degraded alarm', () => {
-  for (const degradedStreak of [0, -1]) {
-    const projected = projectChinaCoverageStatus(chinaSummary({ degradedStreak }));
-    assert.equal(projected.status, 'CHINA_DEGRADED', `degradedStreak=${degradedStreak}`);
+test('china coverage: four rapid evaluations cannot exhaust the wall-clock window', () => {
+  for (const degradedStreak of [1, 2, 3, 4, 12]) {
+    const projected = projectChinaCoverageStatus(
+      chinaSummary({ degradedStreak }),
+      false,
+      CHINA_SUMMARY_AT + ONE_MIN_MS,
+    );
+    assert.equal(__testing__.healthStatusBucket(projected, CHINA_SUMMARY_AT + ONE_MIN_MS), 'ok');
   }
+});
+
+test('china coverage: the hold expires at exactly three hours after the last healthy evaluation', () => {
+  const deadline = CHINA_LAST_HEALTHY_AT + 3 * 60 * ONE_MIN_MS;
+  const projected = projectChinaCoverageStatus(chinaSummary({ degradedStreak: 12 }), false, deadline);
+  assert.equal(projected.status, 'CHINA_DEGRADED');
+  assert.equal(projected.chinaCoveragePendingUntil, undefined);
+  assert.equal(__testing__.healthStatusBucket(projected, deadline), 'warn');
+});
+
+test('china coverage: stale evidence warns immediately', () => {
+  const projected = projectChinaCoverageStatus(chinaSummary({
+    entries: [{
+      id: 'market.china-stock-connect',
+      launchStatus: 'launched',
+      status: 'degraded',
+      reasonCodes: ['CONTENT_STALE'],
+    }],
+  }), false, CHINA_SUMMARY_AT + ONE_MIN_MS);
+  assert.equal(projected.chinaCoveragePendingUntil, undefined);
+  assert.equal(__testing__.healthStatusBucket(projected, CHINA_SUMMARY_AT + ONE_MIN_MS), 'warn');
 });
 
 test('china coverage: a held verdict stays visible rather than silent', () => {
   // The counterweight to the debounce. If holding the verdict also hid the
   // reason, a suppressed cycle would be indistinguishable from health.
-  const projected = projectChinaCoverageStatus(chinaSummary({ degradedStreak: 1 }));
-  assert.equal(projected.status, 'OK');
+  const projected = projectChinaCoverageStatus(
+    chinaSummary({ degradedStreak: 1 }),
+    false,
+    CHINA_SUMMARY_AT + ONE_MIN_MS,
+  );
+  assert.equal(projected.status, 'CHINA_DEGRADED');
   assert.equal(projected.chinaStatus, 'degraded', 'the summary verdict is still reported');
   assert.equal(projected.degradedStreak, 1);
   assert.ok(projected.problems?.some((p) => p.id === 'market.china-stock-connect'));
 });
 
 test('china coverage: a held verdict survives the compact health projection', () => {
-  const projected = projectChinaCoverageStatus(chinaSummary({ degradedStreak: 1 }));
+  const projected = projectChinaCoverageStatus(
+    chinaSummary({ degradedStreak: 1 }),
+    false,
+    CHINA_SUMMARY_AT + ONE_MIN_MS,
+  );
   const compact = healthResponseBody({
     status: 'HEALTHY',
     summary: { total: 1, ok: 1, warn: 0, crit: 0 },
@@ -2240,21 +2401,144 @@ test('china coverage: a held verdict survives the compact health projection', ()
     checks: { chinaCoverage: projected },
   }, true);
 
-  assert.equal(compact.problems?.chinaCoverage?.status, 'OK');
-  assert.equal(compact.problems?.chinaCoverage?.chinaStatus, 'degraded');
-  assert.equal(compact.problems?.chinaCoverage?.degradedStreak, 1);
-  assert.ok(compact.problems?.chinaCoverage?.problems?.some(
+  assert.equal(compact.pending?.chinaCoverage?.status, 'CHINA_DEGRADED');
+  assert.equal(compact.problems?.chinaCoverage, undefined);
+  assert.equal(compact.pending?.chinaCoverage?.chinaStatus, 'degraded');
+  assert.equal(compact.pending?.chinaCoverage?.degradedStreak, 1);
+  assert.ok(compact.pending?.chinaCoverage?.problems?.some(
     (problem) => problem.id === 'market.china-stock-connect',
   ));
   assert.deepEqual(healthResponseBody(compact, true), compact, 'cached compact snapshots remain stable');
 });
 
-test('china coverage: a summary with no streak field alarms as before', () => {
-  // Rollout safety. Every summary written before the producer shipped the field
-  // has no streak; absent evidence must not read as evidence of health, or the
-  // rollout window would silence a genuine outage.
-  const projected = projectChinaCoverageStatus(chinaSummary({ degradedStreak: undefined, degradedProblemKey: undefined }));
+test('china decision signals: aggregate degradation cannot replace producer success evidence', () => {
+  const chinaCoverage = projectChinaCoverageStatus(chinaSummary({
+    degradedStreak: 1,
+    entries: [{
+      id: 'market.china-corporate-disclosures',
+      launchStatus: 'launched',
+      status: 'degraded',
+      reasonCodes: ['CHINA_COVERAGE_PARTIAL'],
+    }],
+    degradedProblemKey: JSON.stringify([{
+      id: 'market.china-corporate-disclosures',
+      status: 'degraded',
+      reasonCodes: ['CHINA_COVERAGE_PARTIAL'],
+    }]),
+  }));
+  const evaluatedAt = Date.parse(chinaCoverage.evaluatedAt);
+  const now = evaluatedAt + 60_000;
+  const decisionSignals = composeChinaDecisionSignalsStatus({
+    status: 'COVERAGE_PARTIAL',
+    records: 5,
+    minRecordCount: 6,
+    decisionGroups: {
+      operationallyCovered: 5,
+      unavailableGroups: [{
+        id: 'corporate-disclosures',
+        unavailableCause: 'upstream_unavailable',
+      }],
+    },
+  }, chinaCoverage, now);
+
+  assert.equal(decisionSignals.status, 'COVERAGE_PARTIAL', 'the diagnosis stays truthful');
+  assert.equal(decisionSignals.chinaCoveragePendingUntil, undefined);
+  assert.equal(__testing__.healthStatusBucket(decisionSignals, now), 'warn');
+});
+
+test('china decision signals: failed publications cannot extend the three-hour validity window', () => {
+  const successAt = NOW - 15 * ONE_MIN_MS;
+  const candidate = {
+    status: 'COVERAGE_PARTIAL',
+    records: 5,
+    minRecordCount: 6,
+    decisionGroups: {
+      operationallyCovered: 5,
+      unavailableGroups: [{
+        id: 'corporate-disclosures',
+        unavailableCause: 'upstream_unavailable',
+      }],
+      coverageLastSuccessAt: successAt,
+    },
+  };
+
+  const composed = composeChinaDecisionSignalsStatus(candidate, null, NOW);
+  assert.equal(composed.status, 'COVERAGE_PARTIAL');
+  assert.equal(
+    composed.chinaCoveragePendingUntil,
+    new Date(successAt + SEED_META.chinaDecisionSignals.maxStaleMin * ONE_MIN_MS).toISOString(),
+  );
+  assert.equal(__testing__.healthStatusBucket(composed, NOW), 'ok');
+  assert.equal(
+    composeChinaDecisionSignalsStatus(candidate, null, successAt + 180 * ONE_MIN_MS)
+      .chinaCoveragePendingUntil,
+    undefined,
+    'the three-hour freshness ceiling still expires the hold',
+  );
+});
+
+test('china decision signals: missing or invalid last-success evidence fails closed', () => {
+  const valid = {
+    status: 'COVERAGE_PARTIAL',
+    records: 5,
+    minRecordCount: 6,
+    decisionGroups: {
+      operationallyCovered: 5,
+      unavailableGroups: [{
+        id: 'corporate-disclosures',
+        unavailableCause: 'upstream_unavailable',
+      }],
+      coverageLastSuccessAt: NOW - 15 * ONE_MIN_MS,
+    },
+  };
+  for (const coverageLastSuccessAt of [undefined, null, Number.NaN]) {
+    const candidate = {
+      ...valid,
+      decisionGroups: { ...valid.decisionGroups, coverageLastSuccessAt },
+    };
+    assert.equal(
+      composeChinaDecisionSignalsStatus(candidate, null, NOW).chinaCoveragePendingUntil,
+      undefined,
+    );
+  }
+});
+
+test('china decision signals: malformed producer evidence cannot use the legacy fallback', () => {
+  const chinaCoverage = projectChinaCoverageStatus(chinaSummary({
+    degradedStreak: 1,
+    entries: [{
+      id: 'market.china-corporate-disclosures',
+      launchStatus: 'launched',
+      status: 'degraded',
+      reasonCodes: ['CHINA_COVERAGE_PARTIAL'],
+    }],
+  }));
+  const entry = {
+    status: 'COVERAGE_PARTIAL',
+    records: 5,
+    minRecordCount: 6,
+    decisionGroups: {
+      operationallyCovered: 5,
+      unavailableGroups: [{
+        id: 'corporate-disclosures',
+        unavailableCause: 'upstream_unavailable',
+      }],
+      coverageFailureInvalidReason: 'FAILURE_TIMESTAMP_MISSING',
+    },
+  };
+
+  assert.equal(
+    composeChinaDecisionSignalsStatus(entry, chinaCoverage, Date.parse(chinaCoverage.evaluatedAt)).chinaCoveragePendingUntil,
+    undefined,
+  );
+});
+
+test('china coverage: a summary with no last-healthy clock alarms immediately', () => {
+  const projected = projectChinaCoverageStatus(chinaSummary({
+    lastHealthyAt: undefined,
+  }), false, CHINA_SUMMARY_AT + ONE_MIN_MS);
   assert.equal(projected.status, 'CHINA_DEGRADED');
+  assert.equal(projected.chinaCoveragePendingUntil, undefined);
 });
 
 test('china coverage: UNAVAILABLE is never debounced', () => {

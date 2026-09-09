@@ -803,11 +803,36 @@ compact-health problem have both advanced. See Railway's official
 [deployment actions reference](https://docs.railway.com/deployments/deployment-actions).
 
 `railway run` is also not production-network evidence: Railway documents it as
-executing locally after injecting service variables. For an immediate long-cron
-backfill, use a controlled temporary Railway cron execution, verify its terminal
-run plus seed metadata and compact health, then restore the captured command and
-schedule and rerun the operational-config audit. The full rollback-safe sequence
-is documented in
+executing locally after injecting service variables. For an authorized
+Cross-Strait history backfill, use the checked-in sandbox runner. It passes only
+server-side references from `seed-bundle-derived-signals`, rejects an incomplete
+canonical/source/history environment before the seeder can start, fetches the
+service's deployed commit, requires a lossless same-run history-ingest
+postflight, and destroys the sandbox after success or failure:
+
+```bash
+npm run railway:cross-strait-history:force -- \
+  --project <project-id> --environment <production-id-or-name> \
+  --confirm-production
+```
+
+The recovery contract is the full retained archive (365 MND reporting days plus
+reviewed Japan rows), not the newest 150 history rows. Scheduled ticks still
+cap each append at 150. The one-off batches through that same boundary so
+embedding cost stays bounded per batch, then requires a lossless same-run
+receipt: validation drops (blank title, missing `occurredAt`, over-limit
+fields) still fail postflight. Confirm `seed-bundle-derived-signals` has
+deployed this batching revision before running; an older seeder will slice the
+archive and the command will exit 75.
+
+The Railway sandbox also has a 15-minute server idle timeout as a cleanup
+backstop if the local process loses its response before it can read the sandbox
+ID. Verify the terminal run, the same-run ingest-health receipt, Convex
+intel-history for `domain=military` `resource=cross-strait-activity`, and
+compact health after the authorized execution. Other immediate long-cron
+backfills still require a controlled temporary Railway cron execution, captured
+command and schedule restoration, and a repeated operational-config audit. The
+full rollback-safe sequence is documented in
 [A merged seeder fix is not live until its cron fires](solutions/integration-issues/merged-is-not-ran-long-cron-seeders.md).
 
 ---
@@ -1286,12 +1311,12 @@ Recovery is accepted only when:
 |---|---|
 | **Service name** | `seed-bundle-macro` |
 | **Start command** | `node scripts/seed-bundle-macro.mjs` |
-| **Cron schedule** | `0 8 * * *` (daily 08:00 UTC) |
+| **Cron schedule** | `0 8,9 * * *` (daily 08:00 and 09:00 UTC) |
 | **Watch paths** | `scripts/**`, `shared/**` |
 | **Replaces** | 6 services |
 | **Net savings** | 5 slots |
 | **Members** | BIS Data (12h), CBR Rates (daily), BoC Valet (daily), StatCan WDS (daily), China Macro (36h), China Release Calendar (36h), China Policy Events (6h), BIS Extended (12h), BLS Series (daily), Eurostat (daily), Eurostat House Prices (7d), Eurostat Government Debt (2d), Eurostat Industrial Production (daily), IMF Macro (30d), National Debt (30d), FAO FFPI (daily), World Bank External Debt (30d), BIS LBS (7d), FATF Listing (30d), Education Attainment (7d) |
-| **Wall budget** | 570 seconds. The runner defers a section when its timeout plus 10-second kill grace cannot fit before Railway's 10-minute limit. Education stays last on six UTC days so a persistent failure in the new flag-dark producer cannot starve established production members; it gets first priority each Sunday UTC so sustained production load cannot defer its first envelope forever. |
+| **Wall budget** | 570 seconds. The runner defers a section when its timeout plus 10-second kill grace cannot fit before Railway's 10-minute limit. Physical Premiums runs first with 80 seconds of admission headroom. Education gets first priority at 08:00 each Sunday UTC, with Physical second. The 09:00 retry always puts Physical first, so a deferred run has another full admission window even when Education fails. Completed members skip through their interval gates. |
 
 ### Bundle 9: seed-bundle-health
 
@@ -1458,8 +1483,8 @@ entries.
 > include valid imports outside `scripts/`. Active rows must instead follow the
 > deploy mode and exact `watchPatterns` recorded in `scripts/railway-services.json`.
 > These rows are intentionally **not** part of the 100-service inventory count
-> above and are registered in `scripts/railway-services.json` with deploy mode
-> `nixpacks-root-repo`.
+> above. The planned rows are registered with deploy mode
+> `nixpacks-root-repo`; active rows use their verified live mode.
 >
 > **Cadence below is inferred from each seed's cache TTL** as a documentation
 > aid; confirm the live cron schedule and Service ID against the Railway
@@ -1487,12 +1512,16 @@ fetch('https://backboard.railway.com/graphql/v2',{method:'POST',
 | seed-market-quotes | `node scripts/seed-market-quotes.mjs` | **planned — not provisioned** | Equity index / stock bootstrap quotes (Yahoo + Finnhub + Alpha Vantage) |
 | seed-commodity-quotes | `node scripts/seed-commodity-quotes.mjs` | ~30 min (30m TTL) | Commodity + extended-gold bootstrap quotes |
 | seed-crypto-sectors | `node scripts/seed-crypto-sectors.mjs` | **planned — not provisioned** | CoinGecko crypto sector performance |
-| seed-market-breadth | `node scripts/seed-market-breadth.mjs` | daily (30d history window) | S&P 500 breadth (% above 20/50/200-day, Barchart) |
+| seed-market-breadth | `node scripts/seed-market-breadth.mjs` | daily (30d history window) | S&P 500 breadth (% above 20/50/200-day, computed from the TradingView constituent scan) |
 | seed-weather-alerts | `node scripts/seed-weather-alerts.mjs` | **planned — not provisioned** | NWS active weather alerts |
 | seed-fx-yoy | `node scripts/seed-fx-yoy.mjs` | daily (25h TTL) | Wide-coverage FX YoY + 24m drawdown (resilience FX-stress inputs) |
 | seed-comtrade-bilateral-hs4 | `node scripts/seed-comtrade-bilateral-hs4.mjs` | **`0 6 1 * *` (monthly, verified 2026-07-27)** | UN Comtrade bilateral HS4 trade flows — only scheduled consumer of the keyed 500/mo Comtrade quota |
 | seed-hs2-chokepoint-exposure | `node scripts/seed-hs2-chokepoint-exposure.mjs` | periodic (TTL-extended) | HS2 chokepoint trade-exposure (derived) |
 | seed-service-statuses | `node scripts/seed-service-statuses.mjs` | **planned — not provisioned** | Service-status warm-ping; primary seeder is the AIS relay loop |
+| seed-imd-cyclone-marine | `node seed-imd-cyclone-marine.mjs` | **`*/15 * * * *` (verified 2026-09-05)** | Official IMD cyclone, port, coastal, and marine products; scripts-root Nixpacks service `5f943d96-5f89-4817-941b-fdc36b71722e` |
+
+Configure the IMD account credentials and the IP-bound production key before
+you activate this service. See [Configure the IMD Railway seeder](natural-disasters.mdx#configure-the-imd-railway-seeder).
 
 The bilateral HS4 cron uses `COMTRADE_API_KEYS` and a 480-request hard budget
 under the provider's 500-call monthly quota. The authenticated route requests

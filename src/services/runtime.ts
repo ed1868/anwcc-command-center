@@ -1,4 +1,5 @@
 import { SITE_VARIANT } from '@/config/variant';
+import { safeStorageGet } from '@/utils/safe-storage';
 import { getClerkToken } from '@/services/clerk';
 import { withBillingVerificationRetry } from '@/services/billing-retry';
 import { hasExplicitDesktopSignals, isDesktopRuntime } from './desktop-runtime';
@@ -371,7 +372,7 @@ export function installRuntimeFetchPatch(): void {
   const nativeFetch = window.fetch.bind(window);
   const dispatch = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
     const target = getApiTargetFromRequestInput(input);
-    const debug = localStorage.getItem('wm-debug-log') === '1';
+    const debug = safeStorageGet('wm-debug-log') === '1';
 
     if (!target?.startsWith('/api/')) {
       if (debug) {
@@ -538,12 +539,21 @@ export function installWebApiRedirect(): void {
           const enriched = await enrichInitForPremium(input, init);
           return fetchWithRedirectFallback(`${API_BASE}${input}`, input, enriched ? withCredentials(enriched) : withCredentials(init));
         }
-        // Absolute URL already targeting the API base (generated clients call fetch
-        // with full URLs like https://api.worldmonitor.app/api/...) — just inject auth.
+        // Generated clients construct an absolute API-base URL, so they cannot
+        // rely on the relative-path branch above for origin recovery. Keep the
+        // same fallback here: browser extensions and network policy can block
+        // api.worldmonitor.app while the page's own /api/ route remains usable.
+        // Only idempotent methods may retry automatically: replaying a mutation
+        // whose response was lost could enqueue or apply it twice server-side.
         if (input.startsWith(`${API_BASE}/api/`)) {
           const pathAndSearch = input.slice(API_BASE.length);
+          const method = (init?.method ?? 'GET').toUpperCase();
           const enriched = await enrichInitForPremium(pathAndSearch, init);
-          return nativeFetch(input, enriched ? withCredentials(enriched) : withCredentials(init));
+          const initWithCredentials = enriched ? withCredentials(enriched) : withCredentials(init);
+          if (method === 'GET' || method === 'HEAD') {
+            return fetchWithRedirectFallback(input, pathAndSearch, initWithCredentials);
+          }
+          return nativeFetch(input, initWithCredentials);
         }
       }
       if (input instanceof URL) {

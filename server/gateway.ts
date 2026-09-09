@@ -36,7 +36,15 @@ import {
   appendDeprecationPolicyLinkToRecord,
   DEPRECATION_POLICY_LINK,
 } from './_shared/deprecation-policy';
-import { projectJsonResponse } from './_shared/response-projection';
+import {
+  REST_ATTRIBUTION_EXPRESSIONS,
+  buildAttributionRider,
+  mergeAttributionRider,
+} from '../shared/attribution-rider';
+import {
+  enforceRestProjectionOutputLimit,
+  projectJsonResponse,
+} from './_shared/response-projection';
 import { getRpcNoStoreReasonFromJson } from './_shared/cache-contract';
 import {
   checkEntitlementDetailed,
@@ -46,6 +54,8 @@ import {
   isEntitlementBackendConfigured,
   type CachedEntitlements,
 } from './_shared/entitlement-check';
+import { EMBED_KEY_RPC_PATHS } from '../shared/embed-panels';
+import { hasEmbedAccess } from '../shared/embed-access';
 import { checkProMcpAccess } from './_shared/pro-mcp-gate';
 import { resolveClerkSession } from './_shared/auth-session';
 import {
@@ -198,17 +208,6 @@ const TIER_CDN_CACHE: Record<CacheTier, string | null> = {
   live: 'public, s-maxage=60, stale-while-revalidate=60, stale-if-error=300',
 };
 
-// REST parity with the MCP dispatch reject: these responses carry
-// attribution-bound provider evidence (resilience indicators, and the BGS
-// mineral evidence behind supply vulnerability), so a projection that strips the
-// source/licence/retrieval fields is refused rather than served.
-const PROJECTION_DISABLED_PATHS: ReadonlySet<string> = new Set([
-  '/api/resilience/v1/get-resilience-indicators',
-  '/api/supply-chain/v1/get-country-vulnerabilities',
-  '/api/supply-chain/v1/get-chokepoint-dependencies',
-  '/api/supply-chain/v1/list-vulnerability-rankings',
-]);
-
 const RPC_CACHE_TIER: Record<string, CacheTier> = {
   // 'live' tier — bbox-quantized + tanker-aware caching upstream of the
   // 60s in-handler cache, absorbing identical-bbox requests at the CDN
@@ -329,6 +328,14 @@ const RPC_CACHE_TIER: Record<string, CacheTier> = {
   '/api/market/v1/list-etf-flows': 'slow',
   '/api/research/v1/list-hackernews-items': 'slow',
   '/api/intelligence/v1/get-country-risk': 'slow',
+  // get-country-coverage is premium-gated via PREMIUM_RPC_PATHS, so the gateway
+  // short-circuits to 'slow-browser' before consulting this map — same as
+  // get-regional-snapshot below. This entry exists to satisfy the parity
+  // contract in tests/route-cache-tier.test.mjs and to record the intended tier
+  // if the endpoint ever stops being premium: `medium` rather than the sibling
+  // `slow`, because the response can carry degraded=true and an hour of shared
+  // edge cache would pin a transient upstream failure long after it healed.
+  '/api/intelligence/v1/get-country-coverage': 'medium',
   '/api/intelligence/v1/get-risk-scores': 'slow',
   '/api/intelligence/v1/get-pizzint-status': 'slow',
   '/api/intelligence/v1/classify-event': 'static',
@@ -469,12 +476,8 @@ const RPC_CACHE_TIER: Record<string, CacheTier> = {
 import { PREMIUM_RPC_PATHS } from '../src/shared/premium-paths';
 
 export const PUBLIC_NO_AUTH_RPC_PATHS = new Set<string>([
-  '/api/conflict/v1/list-acled-events',
-  '/api/natural/v1/list-natural-events',
   '/api/intelligence/v1/get-china-decision-signals',
   '/api/resilience/v1/get-runtime-manifest',
-  '/api/seismology/v1/list-earthquakes',
-  '/api/unrest/v1/list-unrest-events',
   // Lead-capture RPCs serve ANONYMOUS prospects by definition: the /pro
   // marketing page contact form and the waitlist/desktop signup both POST
   // without a wms_ session or API key (see pro-test/src/App.tsx onSubmit and
@@ -1348,7 +1351,20 @@ export function createDomainGateway(
       || isPublicSharedRpcRequest(request.url, request.method);
     const seedRefreshVerified = await isResilienceRankingSeedRefreshRequest(request, pathname);
     const relayWarmPingVerified = await isRelayWarmPingRequest(request, pathname);
-    const requiresDirectLlmQuota = !internalMcpVerified && await shouldReserveGatewayDirectLlmQuota(request, pathname);
+    // Resolve the quota policy against the route POST compatibility will use.
+    // Keep body validation after auth and abuse limiting; invalid bodies still
+    // return before reservation or dispatch.
+    let directLlmPolicyRequest = request;
+    if (
+      request.method === 'POST'
+      && GATEWAY_DIRECT_LLM_QUOTA_METHODS[pathname] === 'GET'
+      && isPostToGetCompatibleBodySize(request.headers)
+      && !router.match(request)
+    ) {
+      const getProbe = new Request(request.url, { method: 'GET', headers: request.headers });
+      if (router.match(getProbe)) directLlmPolicyRequest = getProbe;
+    }
+    const requiresDirectLlmQuota = !internalMcpVerified && await shouldReserveGatewayDirectLlmQuota(directLlmPolicyRequest, pathname);
     const isTierGated = !internalMcpVerified && !isPublicNoAuthRpc && !seedRefreshVerified && !relayWarmPingVerified && getRequiredTier(pathname) !== null;
     // Docker self-hosting has no Clerk/Convex entitlement backend. Its browser
     // still obtains and presents a server-signed anonymous session, so that
@@ -1474,6 +1490,86 @@ export function createDomainGateway(
         // Mirror api/_user-api-key.js serviceUnavailable() (503 + Retry-After +
         // X-Validation-Mode: degraded) so clients retry instead of rotating keys.
         // Duck-type on `code` so partial test mocks of user-api-key still work.
+        const code =
+          typeof err === 'object' && err !== null
+            ? (err as { code?: unknown }).code
+            : undefined;
+        if (code === 'validation_unavailable') {
+          emitRequest(503, 'validation_unavailable', null);
+          return new Response(JSON.stringify({ error: 'Service temporarily unavailable' }), {
+            status: 503,
+            headers: {
+              'Content-Type': 'application/json',
+              'Cache-Control': 'no-store',
+              'Retry-After': '5',
+              'X-Validation-Mode': 'degraded',
+              ...corsHeaders,
+            },
+          });
+        }
+        throw err;
+      }
+    }
+
+    // ── Partner-embed keys (`wme_`) ─────────────────────────────────────────
+    // Accepted ONLY on the RPC paths a paid embed panel declares in the panel
+    // registry, and nowhere else. `EMBED_KEY_RPC_PATHS` is derived from those
+    // declarations, so this surface cannot widen without a panel owning it.
+    //
+    // Not an escalation: neither declared path is tier-gated or in
+    // PREMIUM_RPC_PATHS, so both already answer an anonymous wms_ session
+    // token. What this buys is a credential SHAPE the gateway understands for
+    // a frame that has no session and must stop being handed a wm_ key — the
+    // over-powered credential the whole embed-key stack exists to retire.
+    // Without it, /api/embed/entitlement answers 200 for a wme_ key and the
+    // panel's own data read still 401s, which is a feature that does not work.
+    //
+    // `isUserApiKey` deliberately stays false: an embed key must not enter the
+    // per-account REST meter (#3199) or the apiAccess gate (#4611), and must
+    // not become the request's rate-limit principal — an embed is read by many
+    // viewers on many IPs, so the per-IP bucket is the correct one.
+    if (
+      keyCheck.required &&
+      !keyCheck.valid &&
+      wmKey.startsWith('wme_') &&
+      EMBED_KEY_RPC_PATHS.has(pathname)
+    ) {
+      // Same amplification guard, and the same reasoning, as the wm_ branch
+      // above: an unknown wme_ key costs a Convex lookup, and rotating keys
+      // defeats the per-hash negative cache. Fails closed when Redis is down.
+      const embedGuardResponse = await checkFailClosedScopedIpRateLimit(
+        request,
+        'embed-key:pre-auth-validation',
+        600,
+        '60 s',
+        corsHeaders,
+      );
+      if (embedGuardResponse) {
+        const reason = getRateLimitTelemetryReason(embedGuardResponse, 'rate_limit_429');
+        emitRequest(embedGuardResponse.status, reason, null);
+        return embedGuardResponse;
+      }
+
+      const { validateEmbedKey } = await import('./_shared/embed-key');
+      try {
+        const embedKeyResult = await validateEmbedKey(wmKey);
+        if (embedKeyResult) {
+          const embedEntitlement = await getEntitlements(embedKeyResult.userId);
+          const embedCovered = hasEmbedAccess(embedEntitlement, Date.now());
+          // A transient billing lookup failure must stay retryable rather than
+          // collapse into "invalid key" — the frame backs off on 503 and keeps
+          // its last render, but treats 401/403 as terminal.
+          const billingDenial = denyForBillingVerification(
+            embedEntitlement,
+            corsHeaders,
+            embedCovered,
+          );
+          if (billingDenial) return billingDenial;
+          if (embedCovered) {
+            keyCheck = { valid: true, required: true };
+          }
+        }
+      } catch (err) {
         const code =
           typeof err === 'object' && err !== null
             ? (err as { code?: unknown }).code
@@ -2294,30 +2390,35 @@ export function createDomainGateway(
       // See server/_shared/response-projection.ts + /docs/mcp-jmespath.
       let responseView = new Uint8Array(bodyBytes);
       const jmespathExpr = new URL(request.url).searchParams.get('jmespath');
-      if (
-        PROJECTION_DISABLED_PATHS.has(pathname)
-        && jmespathExpr
-      ) {
-        const errorBody = JSON.stringify({
-          violations: [{
-            field: 'jmespath',
-            description: 'JMESPath projection is not available for this attribution-bound response',
-          }],
-        });
-        emitRequest(400, 'malformed_request', null, errorBody.length);
-        maybeAttachDevHealthHeader(mergedHeaders);
-        return new Response(errorBody, {
-          status: 400,
-          headers: {
-            ...corsHeaders,
-            'Content-Type': 'application/json; charset=utf-8',
-            'X-Content-Type-Options': 'nosniff',
-            'Cache-Control': 'no-store',
-          },
-        });
-      }
       if (jmespathExpr && (mergedHeaders.get('Content-Type') ?? '').includes('application/json')) {
-        const projection = projectJsonResponse(bodyStr, jmespathExpr);
+        let projection = projectJsonResponse(bodyStr, jmespathExpr);
+        if (projection.ok) {
+          // Attribution accompaniment — REST parity with the MCP dispatch rider
+          // (shared/attribution-rider.ts). These paths were refused outright
+          // before; refusal protected two supply-chain paths that carry no
+          // licence field at all while `/api/safety/v1/get-toronto-safety`, which
+          // does, was never on the list. The rider replaces the roster: the
+          // sources are extracted from the UNPROJECTED body and merged AROUND
+          // the projected document, so no expression can reach or remove them.
+          //
+          // Merged BEFORE the ETag hash below, so the ETag covers the rider.
+          // Only the success path carries it: a failed projection is an HTTP 400
+          // that serves no data, so there is nothing to accompany.
+          const attributionExpr = REST_ATTRIBUTION_EXPRESSIONS[pathname];
+          if (attributionExpr !== undefined) {
+            let unprojected: unknown;
+            try {
+              unprojected = JSON.parse(bodyStr);
+            } catch {
+              unprojected = null;
+            }
+            const rider = buildAttributionRider(unprojected, attributionExpr);
+            if (rider !== null) {
+              const projectedBody = mergeAttributionRider(projection.body, rider);
+              projection = enforceRestProjectionOutputLimit(projectedBody, unprojected);
+            }
+          }
+        }
         if (!projection.ok) {
           const errorBody = JSON.stringify(projection.envelope);
           emitRequest(400, 'malformed_request', null, errorBody.length);
