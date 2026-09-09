@@ -1,8 +1,12 @@
-# World Monitor
+# Ai Nomads World Command Center
+
+**A real-time global intelligence command center** — live conflicts, markets, military and civil aviation, maritime AIS, camera feeds, infrastructure, and OSINT signals fused into one situational-awareness workspace, with the **Jarvis** voice agent on top.
+
+Built and maintained by Eddie Ruiz ([@ed1868](https://github.com/ed1868)), the Command Center extends the open-source intelligence dashboard with a custom **Jarvis voice agent** (hands-free briefings and control), **live flight tracking**, **live camera feeds**, and an integrated **AI analyst** for on-demand synthesis across every data stream.
+
+> Built on the open-source [worldmonitor](https://github.com/koala73/worldmonitor) project (AGPL-3.0). This is a derivative work; see [`NOTICE.md`](NOTICE.md) and [`LICENSE`](LICENSE).
 
 [简体中文](README.zh-CN.md) | [日本語](README.ja-JP.md)
-
-**Real-time global intelligence dashboard** — AI-powered news aggregation, geopolitical monitoring, and infrastructure tracking in a unified situational awareness interface.
 
 [![GitHub stars](https://img.shields.io/github/stars/koala73/worldmonitor?style=social)](https://github.com/koala73/worldmonitor/stargazers)
 [![Discord](https://img.shields.io/badge/Discord-Join-5865F2?style=flat&logo=discord&logoColor=white)](https://discord.gg/re63kWKxaz)
