@@ -2,7 +2,7 @@
 ## Observed Source Inventory
 
 {/* BEGIN GENERATED SOURCE ATTRIBUTION */}
-This generated inventory covers **760 active source hosts** representing **747 active providers** (**331 structured/API**, **461 feed**, and **30 operational-status** hosts). It is derived from source declarations in `scripts/`, `server/`, `api/`, and `src/`. Each row shows the configured provider identity and where the source is referenced. Syndication transports such as FeedBurner and Google News remain listed as hosts and are not counted as publishers.
+This generated inventory covers **761 active source hosts** representing **748 active providers** (**332 structured/API**, **461 feed**, and **30 operational-status** hosts). It is derived from source declarations in `scripts/`, `server/`, `api/`, and `src/`. Each row shows the configured provider identity and where the source is referenced. Syndication transports such as FeedBurner and Google News remain listed as hosts and are not counted as publishers.
 
 | Provider | Observed surface |
 | --- | --- |
@@ -20,7 +20,7 @@ This generated inventory covers **760 active source hosts** representing **747 a
 | actualite.cd (actualite.cd) | feed — server/worldmonitor/news/v1/_feeds.ts, src/config/feeds.ts |
 | ActuNiger (actuniger.com) | feed — server/worldmonitor/news/v1/_feeds.ts, src/config/feeds.ts |
 | adsb.fi Open Data (opendata.adsb.fi) | structured — scripts/seed-military-flights.mjs, src/components/MapPopup.ts |
-| adsb.lol (api.adsb.lol) | structured — scripts/ais-relay.cjs, scripts/seed-military-flights.mjs, src/components/MapPopup.ts |
+| adsb.lol (api.adsb.lol) | structured — scripts/ais-relay.cjs, scripts/seed-military-flights.mjs, server/worldmonitor/aviation/v1/_direct-adsblol.ts, src/components/MapPopup.ts |
 | ae.usembassy.gov (ae.usembassy.gov) | structured — scripts/seed-security-advisories.mjs |
 | aerotime.aero (aerotime.aero) | structured — scripts/seed-aviation.mjs, server/worldmonitor/aviation/v1/list-aviation-news.ts |
 | agentskills.io (agentskills.io) | structured — api/skills/fetch-agentskills.ts |
@@ -54,6 +54,7 @@ This generated inventory covers **760 active source hosts** representing **747 a
 | api.iea.org (api.iea.org) | structured — scripts/seed-iea-oil-stocks.mjs |
 | api.imf.org (api.imf.org) | structured — scripts/_seed-utils.mjs, scripts/seed-gold-cb-reserves.mjs |
 | api.indexnow.org (api.indexnow.org) | structured — scripts/seo-indexnow-submit.mjs |
+| api.openai.com (api.openai.com) | structured — api/realtime-token.js, src/services/voice/realtime.ts |
 | api.ossinsight.io (api.ossinsight.io) | structured — scripts/seed-research.mjs |
 | api.planespotters.net (api.planespotters.net) | structured — server/worldmonitor/military/v1/get-wingbits-live-flight.ts |
 | api.rainviewer.com (api.rainviewer.com) | structured — src/components/DeckGLMap.ts |
@@ -437,8 +438,8 @@ This generated inventory covers **760 active source hosts** representing **747 a
 | OpenAQ (api.openaq.org) | structured — scripts/seed-health-air-quality.mjs |
 | openrouter.ai (openrouter.ai) | structured — scripts/lib/brief-dedup-consts.mjs, scripts/lib/company-monitoring-classifier-client.mjs, scripts/regional-snapshot/weekly-brief.mjs |
 | OpenSanctions (api.opensanctions.org) | structured — server/worldmonitor/sanctions/v1/lookup-entity.ts |
-| opensky-network.org (auth.opensky-network.org) | structured — scripts/seed-military-flights.mjs |
-| opensky-network.org (opensky-network.org) | structured — scripts/ais-relay.cjs, scripts/seed-military-flights.mjs, server/worldmonitor/military/v1/list-military-flights.ts, src/components/MapPopup.ts |
+| opensky-network.org (auth.opensky-network.org) | structured — scripts/seed-military-flights.mjs, server/worldmonitor/aviation/v1/_direct-opensky.ts |
+| opensky-network.org (opensky-network.org) | structured — scripts/ais-relay.cjs, scripts/seed-military-flights.mjs, server/worldmonitor/aviation/v1/_direct-opensky.ts, server/worldmonitor/military/v1/list-military-flights.ts, +1 more |
 | openstreetmap.org (openstreetmap.org) | structured — src/config/basemap-styles.ts |
 | ott.tv5monde.com (ott.tv5monde.com) | feed — src/components/LiveNewsPanel.ts |
 | ottawacitizen.com (ottawacitizen.com) | feed — server/worldmonitor/news/v1/_feeds.ts, src/config/feeds.ts |

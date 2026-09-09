@@ -157,3 +157,14 @@ clean: ## Clean generated files
 	@rm -rf $(GEN_SERVER_DIR)
 	@rm -rf $(DOCS_API_DIR)
 	@echo "Clean complete!"
+
+# --- Local command-center stack (see COMMAND-CENTER.md) ---------------------
+up: ## Start the full local stack (Docker backend + seeds + dev server)
+	./scripts/dev-up.sh
+
+down: ## Stop the backend containers + refresh loop
+	./scripts/dev-down.sh
+
+rebuild: ## Rebuild backend images (run after changing relay/server source)
+	node scripts/source-attribution.mjs --write
+	docker compose build redis-rest ais-relay

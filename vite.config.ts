@@ -904,6 +904,415 @@ function webMcpDevSecurityHeadersPlugin(): Plugin {
   };
 }
 
+// Dev-only endpoint for the voice agent: mints ephemeral OpenAI Realtime
+// client secrets so the browser never sees the real key. Production is served
+// by api/realtime-token.js on Vercel; vite has no file-based api/ routing, so
+// this middleware mirrors it for `npm run dev`.
+function realtimeTokenPlugin(): Plugin {
+  return {
+    name: 'realtime-token',
+    configureServer(server) {
+      server.middlewares.use('/api/realtime-token', async (req, res) => {
+        const json = (status: number, body: unknown) => {
+          res.statusCode = status;
+          res.setHeader('Content-Type', 'application/json');
+          res.setHeader('Cache-Control', 'no-store');
+          res.end(JSON.stringify(body));
+        };
+        if (req.method !== 'GET' && req.method !== 'POST') {
+          return json(405, { error: 'Method not allowed' });
+        }
+        const apiKey = process.env.OPENAI_API_KEY;
+        if (!apiKey) {
+          return json(200, { error: 'OPENAI_API_KEY is not set — add it to .env.local and restart the dev server' });
+        }
+        const model = process.env.OPENAI_REALTIME_MODEL || 'gpt-realtime-2.1-mini';
+        const voice = process.env.OPENAI_REALTIME_VOICE || 'cedar';
+        try {
+          const response = await fetch('https://api.openai.com/v1/realtime/client_secrets', {
+            method: 'POST',
+            headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              session: {
+                type: 'realtime',
+                model,
+                audio: {
+                  input: {
+                    noise_reduction: { type: 'near_field' },
+                    turn_detection: { type: 'semantic_vad', eagerness: 'low', create_response: true, interrupt_response: true },
+                  },
+                  output: { voice },
+                },
+              },
+            }),
+          });
+          const body = await response.text();
+          res.statusCode = response.status;
+          res.setHeader('Content-Type', response.headers.get('content-type') || 'application/json');
+          res.setHeader('Cache-Control', 'no-store');
+          res.setHeader('X-Voice-Model', model);
+          res.end(body);
+        } catch (error) {
+          json(502, { error: error instanceof Error ? error.message : 'Failed to mint Realtime token' });
+        }
+      });
+    },
+  };
+}
+
+// Dev-only OpenSky proxy for the voice agent's whole-sky area scans.
+// Authenticates with OPENSKY_CLIENT_ID/SECRET (OAuth client-credentials) when
+// present — anonymous otherwise — and passes bbox params through to /states/all.
+function openskyPlugin(): Plugin {
+  let cachedToken: { value: string; expiresAt: number } | null = null;
+
+  async function getAccessToken(): Promise<string | null> {
+    const id = process.env.OPENSKY_CLIENT_ID;
+    const secret = process.env.OPENSKY_CLIENT_SECRET;
+    if (!id || !secret) return null;
+    if (cachedToken && Date.now() < cachedToken.expiresAt - 60_000) return cachedToken.value;
+    const res = await fetch('https://auth.opensky-network.org/auth/realms/opensky-network/protocol/openid-connect/token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({ grant_type: 'client_credentials', client_id: id, client_secret: secret }),
+    });
+    if (!res.ok) return null;
+    const body = await res.json() as { access_token?: string; expires_in?: number };
+    if (!body.access_token) return null;
+    cachedToken = { value: body.access_token, expiresAt: Date.now() + (body.expires_in ?? 1800) * 1000 };
+    return cachedToken.value;
+  }
+
+  return {
+    name: 'opensky-proxy',
+    configureServer(server) {
+      server.middlewares.use('/api/opensky', async (req, res) => {
+        res.setHeader('Content-Type', 'application/json');
+        res.setHeader('Cache-Control', 'no-store');
+        try {
+          const url = new URL(req.url || '', 'http://localhost');
+          const upstream = new URL('https://opensky-network.org/api/states/all');
+          for (const key of ['lamin', 'lamax', 'lomin', 'lomax']) {
+            const v = url.searchParams.get(key);
+            if (v !== null) upstream.searchParams.set(key, v);
+          }
+          const token = await getAccessToken();
+          const headers: Record<string, string> = { Accept: 'application/json' };
+          if (token) headers.Authorization = `Bearer ${token}`;
+          const controller = new AbortController();
+          const timer = setTimeout(() => controller.abort(), 15_000);
+          const upstreamRes = await fetch(upstream, { headers, signal: controller.signal });
+          clearTimeout(timer);
+          res.statusCode = upstreamRes.status;
+          res.end(await upstreamRes.text());
+        } catch (error) {
+          res.statusCode = 502;
+          res.end(JSON.stringify({ error: error instanceof Error ? error.message : 'OpenSky request failed' }));
+        }
+      });
+    },
+  };
+}
+
+// Dev-only free route lookup for the voice agent: callsign → origin/destination
+// airports via adsbdb.com (no key, CORS-proxied here). Session-cached; adsbdb
+// asks for gentle use so misses are cached too.
+function routeLookupPlugin(): Plugin {
+  const cache = new Map<string, { body: string; expiresAt: number }>();
+  const TTL = 30 * 60_000;
+  return {
+    name: 'route-lookup',
+    configureServer(server) {
+      server.middlewares.use('/api/route-lookup', async (req, res) => {
+        res.setHeader('Content-Type', 'application/json');
+        res.setHeader('Cache-Control', 'no-store');
+        try {
+          const url = new URL(req.url || '', 'http://localhost');
+          const callsign = (url.searchParams.get('callsign') || '').trim().toUpperCase();
+          if (!callsign || !/^[A-Z0-9]{2,8}$/.test(callsign)) {
+            res.statusCode = 400;
+            res.end(JSON.stringify({ error: 'invalid callsign' }));
+            return;
+          }
+          const hit = cache.get(callsign);
+          if (hit && hit.expiresAt > performance.now()) {
+            res.end(hit.body);
+            return;
+          }
+          let origin: string | null = null;
+          let destination: string | null = null;
+          try {
+            const r = await fetch(`https://api.adsbdb.com/v0/callsign/${encodeURIComponent(callsign)}`, {
+              signal: AbortSignal.timeout(8_000),
+            });
+            if (r.ok) {
+              const d = await r.json() as { response?: { flightroute?: { origin?: { iata_code?: string; name?: string; municipality?: string }; destination?: { iata_code?: string; name?: string; municipality?: string } } } };
+              const fr = d.response?.flightroute;
+              if (fr?.origin) origin = fr.origin.iata_code ? `${fr.origin.iata_code} (${fr.origin.municipality || fr.origin.name || ''})`.trim() : null;
+              if (fr?.destination) destination = fr.destination.iata_code ? `${fr.destination.iata_code} (${fr.destination.municipality || fr.destination.name || ''})`.trim() : null;
+            }
+          } catch { /* leave nulls */ }
+          const body = JSON.stringify({ callsign, origin, destination });
+          cache.set(callsign, { body, expiresAt: performance.now() + TTL });
+          res.end(body);
+        } catch (error) {
+          res.statusCode = 502;
+          res.end(JSON.stringify({ error: error instanceof Error ? error.message : 'route lookup failed' }));
+        }
+      });
+    },
+  };
+}
+
+// Dev-only adsb.lol proxy for the voice agent — free, no-key ADS-B with
+// aircraft type + registration. Takes a bbox, queries adsb.lol by radius, and
+// returns the rich records the agent needs (positions, type, tail number).
+function adsbLolPlugin(): Plugin {
+  return {
+    name: 'adsblol',
+    configureServer(server) {
+      server.middlewares.use('/api/adsblol', async (req, res) => {
+        res.setHeader('Content-Type', 'application/json');
+        res.setHeader('Cache-Control', 'no-store');
+        try {
+          const url = new URL(req.url || '', 'http://localhost');
+          const swLat = Number(url.searchParams.get('lamin'));
+          const neLat = Number(url.searchParams.get('lamax'));
+          const swLon = Number(url.searchParams.get('lomin'));
+          const neLon = Number(url.searchParams.get('lomax'));
+          if ([swLat, neLat, swLon, neLon].some((v) => !Number.isFinite(v))) {
+            res.statusCode = 400;
+            res.end(JSON.stringify({ error: 'lamin/lamax/lomin/lomax required' }));
+            return;
+          }
+          const lat = (swLat + neLat) / 2;
+          const lon = (swLon + neLon) / 2;
+          const midRad = (lat * Math.PI) / 180;
+          const halfDiagKm = 0.5 * Math.hypot(Math.abs(neLat - swLat) * 111, Math.abs(neLon - swLon) * 111 * Math.cos(midRad));
+          const nm = Math.min(250, Math.max(10, Math.round(halfDiagKm / 1.852)));
+          const upstream = await fetch(`https://api.adsb.lol/v2/lat/${lat}/lon/${lon}/dist/${nm}`, {
+            // adsb.lol 403s requests without a descriptive User-Agent.
+            headers: { Accept: 'application/json', 'User-Agent': 'worldmonitor-selfhost/1.0' },
+            signal: AbortSignal.timeout(10_000),
+          });
+          if (!upstream.ok) {
+            res.statusCode = 502;
+            res.end(JSON.stringify({ error: `adsb.lol HTTP ${upstream.status}`, ac: [] }));
+            return;
+          }
+          res.end(await upstream.text());
+        } catch (error) {
+          res.statusCode = 502;
+          res.end(JSON.stringify({ error: error instanceof Error ? error.message : 'adsb.lol failed', ac: [] }));
+        }
+      });
+    },
+  };
+}
+
+// Dev-only ISS TLE proxy — fetches the ISS orbital elements from CelesTrak
+// (CORS-safe, cached 30 min) so the voice agent can predict overhead passes.
+function issTlePlugin(): Plugin {
+  let cache: { body: string; expiresAt: number } | null = null;
+  return {
+    name: 'iss-tle',
+    configureServer(server) {
+      server.middlewares.use('/api/iss-tle', async (_req, res) => {
+        res.setHeader('Content-Type', 'application/json');
+        res.setHeader('Cache-Control', 'no-store');
+        try {
+          if (cache && cache.expiresAt > performance.now()) {
+            res.end(cache.body);
+            return;
+          }
+          const r = await fetch('https://celestrak.org/NORAD/elements/gp.php?CATNR=25544&FORMAT=TLE', {
+            headers: { 'User-Agent': 'worldmonitor-selfhost/1.0' },
+            signal: AbortSignal.timeout(8_000),
+          });
+          if (!r.ok) throw new Error(`CelesTrak HTTP ${r.status}`);
+          const text = (await r.text()).trim();
+          const [name, line1, line2] = text.split('\n').map((l) => l.trim());
+          if (!line1 || !line2) throw new Error('malformed TLE');
+          const body = JSON.stringify({ name, line1, line2 });
+          cache = { body, expiresAt: performance.now() + 30 * 60_000 };
+          res.end(body);
+        } catch (error) {
+          res.statusCode = 502;
+          res.end(JSON.stringify({ error: error instanceof Error ? error.message : 'ISS TLE fetch failed' }));
+        }
+      });
+    },
+  };
+}
+
+// Dev-only public traffic-camera catalog. Fetches Caltrans (CA DOT) districts
+// + TfL London JamCams, normalizes to a common record with a live snapshot
+// URL, caches the full catalog 15 min, and returns cameras inside a bbox.
+interface TrafficCam { id: string; title: string; lat: number; lon: number; image: string; video: string | null; provider: string; }
+
+function trafficCamsPlugin(): Plugin {
+  let catalog: TrafficCam[] = [];
+  let builtAt = 0;
+  const TTL = 15 * 60_000;
+  const CALTRANS_DISTRICTS = ['3', '4', '7', '11']; // Sacramento, Bay Area, LA, San Diego
+
+  async function fetchCaltrans(): Promise<TrafficCam[]> {
+    const out: TrafficCam[] = [];
+    await Promise.all(CALTRANS_DISTRICTS.map(async (d) => {
+      try {
+        const dd = d.padStart(2, '0');
+        const r = await fetch(`https://cwwp2.dot.ca.gov/data/d${d}/cctv/cctvStatusD${dd}.json`, { signal: AbortSignal.timeout(10_000) });
+        if (!r.ok) return;
+        const data = await r.json() as { data?: Array<{ cctv?: { index?: string; location?: { locationName?: string; latitude?: string; longitude?: string }; imageData?: { static?: { currentImageURL?: string }; streamingVideoURL?: string } } }> };
+        for (const item of data.data ?? []) {
+          const c = item.cctv;
+          const lat = Number(c?.location?.latitude);
+          const lon = Number(c?.location?.longitude);
+          const image = c?.imageData?.static?.currentImageURL;
+          if (!Number.isFinite(lat) || !Number.isFinite(lon) || !image || lat === 0) continue;
+          out.push({
+            id: `caltrans-d${d}-${c?.index ?? out.length}`,
+            title: c?.location?.locationName?.trim() || 'Caltrans camera',
+            lat, lon, image,
+            video: c?.imageData?.streamingVideoURL || null,
+            provider: 'Caltrans',
+          });
+        }
+      } catch { /* skip district */ }
+    }));
+    return out;
+  }
+
+  async function fetchTfl(): Promise<TrafficCam[]> {
+    try {
+      const r = await fetch('https://api.tfl.gov.uk/Place/Type/JamCam', { signal: AbortSignal.timeout(12_000) });
+      if (!r.ok) return [];
+      const data = await r.json() as Array<{ id?: string; commonName?: string; lat?: number; lon?: number; additionalProperties?: Array<{ key?: string; value?: string }> }>;
+      return data.map((c) => {
+        const props = Object.fromEntries((c.additionalProperties ?? []).map((p) => [p.key, p.value]));
+        const image = props.imageUrl;
+        if (typeof c.lat !== 'number' || typeof c.lon !== 'number' || !image) return null;
+        return {
+          id: `tfl-${c.id ?? ''}`,
+          title: c.commonName || 'London JamCam',
+          lat: c.lat, lon: c.lon, image,
+          video: props.videoUrl || null,
+          provider: 'TfL London',
+        } as TrafficCam;
+      }).filter((x): x is TrafficCam => x !== null);
+    } catch { return []; }
+  }
+
+  async function fetchFlorida(): Promise<TrafficCam[]> {
+    // Florida DOT (FL511): ~4,950 cameras. The map feed gives location +
+    // itemId; the live JPEG snapshot is at /map/Cctv/{itemId} (CORS-open,
+    // refreshed ~every 15-30s). HLS video needs a session token, so we use the
+    // snapshot (the viewer auto-refreshes it).
+    try {
+      const r = await fetch('https://fl511.com/map/mapIcons/Cameras', {
+        headers: { 'User-Agent': 'worldmonitor-selfhost/1.0', Accept: 'application/json' },
+        signal: AbortSignal.timeout(15_000),
+      });
+      if (!r.ok) return [];
+      const data = await r.json() as { item2?: Array<{ itemId?: string; location?: [number, number]; expando?: { videoEnabled?: boolean } }> };
+      const out: TrafficCam[] = [];
+      for (const c of data.item2 ?? []) {
+        const loc = c.location;
+        if (!c.itemId || !loc || typeof loc[0] !== 'number' || typeof loc[1] !== 'number') continue;
+        out.push({
+          id: `fl511-${c.itemId}`,
+          title: 'Florida DOT camera',
+          lat: loc[0], lon: loc[1],
+          image: `https://fl511.com/map/Cctv/${encodeURIComponent(c.itemId)}`,
+          video: null,
+          provider: 'Florida DOT',
+        });
+      }
+      return out;
+    } catch { return []; }
+  }
+
+  async function ensureCatalog(): Promise<void> {
+    if (catalog.length && performance.now() - builtAt < TTL) return;
+    const [ca, tfl, fl] = await Promise.all([fetchCaltrans(), fetchTfl(), fetchFlorida()]);
+    catalog = [...ca, ...tfl, ...fl];
+    builtAt = performance.now();
+  }
+
+  return {
+    name: 'traffic-cams',
+    configureServer(server) {
+      server.middlewares.use('/api/trafficcams', async (req, res) => {
+        res.setHeader('Content-Type', 'application/json');
+        res.setHeader('Cache-Control', 'no-store');
+        try {
+          await ensureCatalog();
+          const url = new URL(req.url || '', 'http://localhost');
+          const swLat = Number(url.searchParams.get('lamin'));
+          const neLat = Number(url.searchParams.get('lamax'));
+          const swLon = Number(url.searchParams.get('lomin'));
+          const neLon = Number(url.searchParams.get('lomax'));
+          const limit = Math.min(500, Math.max(1, Number(url.searchParams.get('limit')) || 400));
+          let cams = catalog;
+          if ([swLat, neLat, swLon, neLon].every(Number.isFinite)) {
+            cams = catalog.filter((c) => c.lat >= swLat && c.lat <= neLat && c.lon >= swLon && c.lon <= neLon);
+          }
+          res.end(JSON.stringify({ total: catalog.length, count: Math.min(cams.length, limit), cams: cams.slice(0, limit) }));
+        } catch (error) {
+          res.statusCode = 502;
+          res.end(JSON.stringify({ error: error instanceof Error ? error.message : 'traffic cams failed', cams: [] }));
+        }
+      });
+    },
+  };
+}
+
+// Dev-only proxy for upcoming rocket launches (The Space Devs Launch Library 2,
+// free/no key). Cached 30 min — LL2 rate-limits the detailed endpoint.
+function launchesPlugin(): Plugin {
+  let cache: { body: string; expiresAt: number } | null = null;
+  return {
+    name: 'rocket-launches',
+    configureServer(server) {
+      server.middlewares.use('/api/launches', async (_req, res) => {
+        res.setHeader('Content-Type', 'application/json');
+        res.setHeader('Cache-Control', 'no-store');
+        try {
+          if (cache && cache.expiresAt > performance.now()) { res.end(cache.body); return; }
+          const r = await fetch('https://ll.thespacedevs.com/2.3.0/launches/upcoming/?limit=12', {
+            headers: { 'User-Agent': 'worldmonitor-selfhost/1.0', Accept: 'application/json' },
+            signal: AbortSignal.timeout(12_000),
+          });
+          if (!r.ok) { res.statusCode = 502; res.end(JSON.stringify({ error: `LL2 HTTP ${r.status}`, launches: [] })); return; }
+          const d = await r.json() as { results?: Array<Record<string, unknown>> };
+          const launches = (d.results ?? []).map((l) => {
+            const pad = (l.pad ?? {}) as Record<string, unknown>;
+            const loc = (pad.location ?? {}) as Record<string, unknown>;
+            const prov = (l.launch_service_provider ?? {}) as Record<string, unknown>;
+            const mission = (l.mission ?? {}) as Record<string, unknown>;
+            return {
+              name: l.name ?? '',
+              net: l.net ?? null,
+              provider: prov.name ?? null,
+              mission: mission.name ?? null,
+              status: ((l.status ?? {}) as Record<string, unknown>).abbrev ?? null,
+              pad: loc.name ?? pad.name ?? null,
+              lat: pad.latitude != null ? Number(pad.latitude) : null,
+              lon: pad.longitude != null ? Number(pad.longitude) : null,
+            };
+          });
+          const body = JSON.stringify({ count: launches.length, launches });
+          cache = { body, expiresAt: performance.now() + 30 * 60_000 };
+          res.end(body);
+        } catch (error) {
+          res.statusCode = 502;
+          res.end(JSON.stringify({ error: error instanceof Error ? error.message : 'launches failed', launches: [] }));
+        }
+      });
+    },
+  };
+}
+
 export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, process.cwd(), '');
   // Inject environment variables from .env files into process.env.
@@ -943,6 +1352,13 @@ export default defineConfig(({ mode }) => {
       __BUILD_HASH__: JSON.stringify(process.env.VERCEL_GIT_COMMIT_SHA ?? 'dev'),
     },
     plugins: [
+      realtimeTokenPlugin(),
+      openskyPlugin(),
+      adsbLolPlugin(),
+      routeLookupPlugin(),
+      issTlePlugin(),
+      trafficCamsPlugin(),
+      launchesPlugin(),
       // Emit dist/build-hash.txt with the deployed SHA so the running bundle
       // can fetch /build-hash.txt at tab-focus time and force-reload itself
       // if it's running an older bundle (see src/bootstrap/stale-bundle-check.ts).

@@ -466,6 +466,9 @@
           "path": "scripts/seed-military-flights.mjs"
         },
         {
+          "path": "server/worldmonitor/aviation/v1/_direct-adsblol.ts"
+        },
+        {
           "path": "src/components/MapPopup.ts"
         }
       ]
@@ -935,6 +938,23 @@
       "references": [
         {
           "path": "scripts/lib/open511.mjs"
+        }
+      ]
+    },
+    {
+      "host": "api.openai.com",
+      "provider": "api.openai.com",
+      "kind": "structured",
+      "observed": true,
+      "license": "Provider terms for this upstream API/dataset; verify before redistribution",
+      "attribution": "Credit api.openai.com and link to the original upstream API/dataset.",
+      "status": "terms-review",
+      "references": [
+        {
+          "path": "api/realtime-token.js"
+        },
+        {
+          "path": "src/services/voice/realtime.ts"
         }
       ]
     },
@@ -1714,6 +1734,9 @@
       "references": [
         {
           "path": "scripts/seed-military-flights.mjs"
+        },
+        {
+          "path": "server/worldmonitor/aviation/v1/_direct-opensky.ts"
         }
       ]
     },
@@ -6834,6 +6857,9 @@
         },
         {
           "path": "scripts/seed-military-flights.mjs"
+        },
+        {
+          "path": "server/worldmonitor/aviation/v1/_direct-opensky.ts"
         },
         {
           "path": "server/worldmonitor/military/v1/list-military-flights.ts"

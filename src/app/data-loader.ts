@@ -3808,9 +3808,14 @@ export class DataLoaderManager implements AppModule {
       this.lastWebcamBbox = { w, s, e, n, zoom };
 
       const { fetchWebcams } = await import('@/services/webcams');
-      const result = await fetchWebcams(zoom, { w, s, e, n });
+      const { fetchTrafficCams } = await import('@/services/traffic-cams');
+      const { cityCamMarkers } = await import('@/services/city-cams');
+      const [result, trafficCams] = await Promise.all([
+        fetchWebcams(zoom, { w, s, e, n }),
+        fetchTrafficCams({ w, s, e, n }),
+      ]);
 
-      const allMarkers = [...result.webcams, ...result.clusters];
+      const allMarkers = [...cityCamMarkers({ w, s, e, n }), ...result.webcams, ...trafficCams, ...result.clusters];
       map.setWebcams(allMarkers);
       map.setLayerReady('webcams', allMarkers.length > 0);
     } catch (err) {

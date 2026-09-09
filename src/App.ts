@@ -275,6 +275,7 @@ const DEFAULT_VIEWPORT_MARGIN_PX = 400;
 // run site (#4486) so the engine bytes stay off the eager boot graph. The TYPE is
 // referenced via the inline `import(...)` type in app-context.ts (erased at build).
 import type { CorrelationPanel } from '@/components/CorrelationPanel';
+import { VoiceControl } from '@/components/VoiceControl';
 
 const CYBER_LAYER_ENABLED = import.meta.env.VITE_ENABLE_CYBER_LAYER === 'true';
 const FREE_MAP_PANEL_ACCESS_KEY = 'worldmonitor-free-map-panel-access-v1';
@@ -298,6 +299,7 @@ export class App {
   private panelLayout: PanelLayoutManager;
   private dataLoader: DataLoaderManager;
   private eventHandlers: EventHandlerManager;
+  private voiceControl: VoiceControl | null = null;
   private searchManager: SearchManager | null = null;
   private searchManagerLoad: Promise<SearchManager> | null = null;
   private signalModalLoad: Promise<SignalModalInstance> | null = null;
@@ -2631,6 +2633,11 @@ export class App {
     // Phase 2: Shared UI components
     if (!this.state.isMobile) {
       void this.initFindingsBadge();
+      this.voiceControl = new VoiceControl(this.state);
+    }
+    // Dev-only handle for map/voice debugging (map annotations, layer toggles).
+    if (import.meta.env.DEV) {
+      (window as unknown as { __wm?: unknown }).__wm = { state: this.state, map: this.state.map };
     }
 
     initBreakingNewsAlerts();
@@ -3259,6 +3266,8 @@ export class App {
 
   public destroy(): void {
     this.state.isDestroyed = true;
+    this.voiceControl?.destroy();
+    this.voiceControl = null;
     this.latestSearchAdsb = [];
     this.latestSearchMilitary = [];
     this.latestSearchAdsbUpdatedAt = 0;

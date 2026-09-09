@@ -6,10 +6,29 @@ import { t } from '../services/i18n';
 import { track, trackWebcamSelected, trackWebcamRegionFiltered } from '@/services/analytics';
 import { getStreamQuality, subscribeStreamQualityChange } from '@/services/ai-flow-settings';
 import { isMobileDevice, loadFromStorage, saveToStorage } from '@/utils';
-import { playAllLiveMedia, registerLiveMediaStarter, unregisterLiveMediaStarter, type LiveMediaStopReason } from '@/services/live-media-controller';
+import { registerLiveMediaStarter, unregisterLiveMediaStarter, type LiveMediaStopReason } from '@/services/live-media-controller';
 import { getLiveStreamsAlwaysOn, subscribeLiveStreamsSettingsChange } from '@/services/live-stream-settings';
 import { setTrustedHtml, trustedHtml } from '@/utils/dom-utils';
 import { isAllowedWebcamEmbedMessageOrigin } from './_live-webcams-origin';
+import { fetchLiveVideoInfo } from '@/services/live-news';
+
+// Resolve the CURRENT live-stream video id for a channel handle, so a rotated
+// stream doesn't leave a stale hardcoded id showing "Video unavailable". Cached
+// per channel for the session; falls back to the caller's hardcoded id.
+const liveVideoIdCache = new Map<string, string>();
+async function resolveLiveVideoId(channelHandle: string, fallback: string): Promise<string> {
+  if (!channelHandle) return fallback;
+  const cached = liveVideoIdCache.get(channelHandle);
+  if (cached) return cached;
+  try {
+    const info = await fetchLiveVideoInfo(channelHandle);
+    if (info.videoId) {
+      liveVideoIdCache.set(channelHandle, info.videoId);
+      return info.videoId;
+    }
+  } catch { /* keep fallback */ }
+  return fallback;
+}
 
 
 type WebcamRegion = 'middle-east' | 'europe' | 'asia' | 'americas' | 'space';
@@ -25,35 +44,28 @@ interface WebcamFeed {
 
 // Verified YouTube live stream IDs — validated Feb 2026 via title cross-check.
 // IDs may rotate; update when stale.
+// Curated 2026-09-08: only reliably-live channels (verified via /api/youtube/live).
+// The panel resolves each channel's CURRENT live video at runtime; fallbackVideoId
+// is a last-resort backup. One entry per channel (a handle resolves to one live
+// stream), labelled by what that channel actually streams.
 const WEBCAM_FEEDS: WebcamFeed[] = [
-  // Middle East — Jerusalem & Tehran adjacent (conflict hotspots)
-  { id: 'jerusalem', city: 'Jerusalem', country: 'Israel', region: 'middle-east', channelHandle: '@TheWesternWall', fallbackVideoId: 'e34xb-Fbl0U' },
-  { id: 'middle-east', city: 'Middle East', country: 'Multi', region: 'middle-east', channelHandle: '@MiddleEastCams', fallbackVideoId: 'oxT5R6I0N6E' },
-  { id: 'tel-aviv', city: 'Tel Aviv', country: 'Israel', region: 'middle-east', channelHandle: '@IsraelLiveCam', fallbackVideoId: 'gmtlJ_m2r5A' },
-  { id: 'mecca', city: 'Mecca', country: 'Saudi Arabia', region: 'middle-east', channelHandle: '@MakkahLive', fallbackVideoId: 'kJwEsQTegxk' },
-  { id: 'beirut-mtv', city: 'Beirut', country: 'Lebanon', region: 'middle-east', channelHandle: '@MTVLebanonNews', fallbackVideoId: 'djF-Lkgfp6k' },
   // Europe
-  { id: 'kyiv', city: 'Kyiv', country: 'Ukraine', region: 'europe', channelHandle: '@DWNews', fallbackVideoId: '-Q7FuPINDjA' },
-  { id: 'odessa', city: 'Odessa', country: 'Ukraine', region: 'europe', channelHandle: '@UkraineLiveCam', fallbackVideoId: 'e2gC37ILQmk' },
-  { id: 'paris', city: 'Paris', country: 'France', region: 'europe', channelHandle: '@PalaisIena', fallbackVideoId: 'OzYp4NRZlwQ' },
-  { id: 'st-petersburg', city: 'St. Petersburg', country: 'Russia', region: 'europe', channelHandle: '@SPBLiveCam', fallbackVideoId: 'CjtIYbmVfck' },
-  { id: 'london', city: 'London', country: 'UK', region: 'europe', channelHandle: '@EarthCam', fallbackVideoId: 'Lxqcg1qt0XU' },
+  { id: 'kyiv-dw', city: 'Kyiv / DW Live', country: 'Ukraine', region: 'europe', channelHandle: '@DWNews', fallbackVideoId: 'LuKwFajn37U' },
+  { id: 'italy-skyline', city: 'Italy (SkylineWebcams)', country: 'Italy', region: 'europe', channelHandle: '@SkylineWebcams', fallbackVideoId: 'kUfuwa8mDrA' },
   // Americas
-  { id: 'washington', city: 'Washington DC', country: 'USA', region: 'americas', channelHandle: '@AxisCommunications', fallbackVideoId: '1wV9lLe14aU' },
-  { id: 'new-york', city: 'New York', country: 'USA', region: 'americas', channelHandle: '@EarthCam', fallbackVideoId: '4qyZLflp-sI' },
-  { id: 'los-angeles', city: 'Los Angeles', country: 'USA', region: 'americas', channelHandle: '@VeniceVHotel', fallbackVideoId: 'EO_1LWqsCNE' },
-  { id: 'miami', city: 'Miami', country: 'USA', region: 'americas', channelHandle: '@FloridaLiveCams', fallbackVideoId: '5YCajRjvWCg' },
-  // Asia-Pacific — Taipei first (strait hotspot), then Shanghai, Tokyo, Seoul
+  { id: 'nyc-times-square', city: 'Times Square, NYC', country: 'USA', region: 'americas', channelHandle: '@EarthCam', fallbackVideoId: 'qbsgcchN2-Y' },
+  { id: 'chicago', city: 'Chicago', country: 'USA', region: 'americas', channelHandle: '@abc7chicago', fallbackVideoId: 'sj2cWegO1OU' },
+  { id: 'miami-local10', city: 'Miami (Local 10)', country: 'USA', region: 'americas', channelHandle: '@WPLGLocal10', fallbackVideoId: 'Rr387XjUXCY' },
+  { id: 'key-west', city: 'Key West, FL', country: 'USA', region: 'americas', channelHandle: '@SloppyJoesBarKeyWest', fallbackVideoId: 'rbMK4p6zUwI' },
+  { id: 'florida-keys', city: 'Florida Keys', country: 'USA', region: 'americas', channelHandle: '@OceanReefResorts', fallbackVideoId: '_Zqi24i0fl4' },
+  { id: 'monterey-aquarium', city: 'Monterey Bay Aquarium', country: 'USA', region: 'americas', channelHandle: '@MontereyBayAquarium', fallbackVideoId: 'zL68biE6wAs' },
+  // Asia-Pacific
   { id: 'taipei', city: 'Taipei', country: 'Taiwan', region: 'asia', channelHandle: '@JackyWuTaipei', fallbackVideoId: 'z_fY1pj1VBw' },
-  { id: 'shanghai', city: 'Shanghai', country: 'China', region: 'asia', channelHandle: '@SkylineWebcams', fallbackVideoId: '76EwqI5XZIc' },
-  { id: 'tokyo', city: 'Tokyo', country: 'Japan', region: 'asia', channelHandle: '@TokyoLiveCam4K', fallbackVideoId: '_k-5U7IeK8g' },
-  { id: 'seoul', city: 'Seoul', country: 'South Korea', region: 'asia', channelHandle: '@UNvillage_live', fallbackVideoId: '-JhoMGoAfFc' },
+  { id: 'tokyo-ann', city: 'Tokyo (ANN News)', country: 'Japan', region: 'asia', channelHandle: '@ANNnewsCH', fallbackVideoId: 'ZRiZsmMf4uY' },
   { id: 'sydney', city: 'Sydney', country: 'Australia', region: 'asia', channelHandle: '@WebcamSydney', fallbackVideoId: '7pcL-0Wo77U' },
   // Space
-  { id: 'iss-earth', city: 'ISS Earth View', country: 'Space', region: 'space', channelHandle: '@NASA', fallbackVideoId: 'vytmBNhc9ig' },
-  { id: 'nasa-live', city: 'NASA TV', country: 'Space', region: 'space', channelHandle: '@NASA', fallbackVideoId: 'zPH5KtjJFaQ' },
-  { id: 'space-x', city: 'SpaceX', country: 'Space', region: 'space', channelHandle: '@SpaceX', fallbackVideoId: 'fO9e9jnhYK8' },
-  { id: 'space-walk', city: 'Space', country: 'Space', region: 'space', channelHandle: '@NASA', fallbackVideoId: 'fO9e9jnhYK8' },
+  { id: 'nasa-iss', city: 'NASA / ISS Live', country: 'Space', region: 'space', channelHandle: '@NASA', fallbackVideoId: 'M3HKLzjvKPc' },
+  { id: 'spacex', city: 'SpaceX (live for launches)', country: 'Space', region: 'space', channelHandle: '@SpaceX', fallbackVideoId: 'fO9e9jnhYK8' },
 ];
 
 const MAX_GRID_CELLS = 4;
@@ -332,6 +344,14 @@ export class LiveWebcamsPanel extends Panel {
     const iframe = document.createElement('iframe');
     iframe.className = 'webcam-iframe';
     iframe.src = this.buildEmbedUrl(feed.fallbackVideoId);
+    // Swap to the channel's CURRENT live stream once resolved — the hardcoded
+    // fallback id rots as streams rotate. Only replace if still mounted, still
+    // this feed, and the resolved id actually differs.
+    void resolveLiveVideoId(feed.channelHandle, feed.fallbackVideoId).then((videoId) => {
+      if (videoId !== feed.fallbackVideoId && iframe.isConnected) {
+        iframe.src = this.buildEmbedUrl(videoId);
+      }
+    });
     iframe.title = `${feed.city} live webcam`;
     iframe.allow = 'autoplay; encrypted-media; picture-in-picture; storage-access';
     iframe.referrerPolicy = 'strict-origin-when-cross-origin';
@@ -519,19 +539,25 @@ export class LiveWebcamsPanel extends Panel {
     playBtn.type = 'button';
     playBtn.className = 'offline-retry webcam-preview-play';
     playBtn.textContent = t('components.webcams.play') || 'Play';
-    // First play intent lights up everything (the wall + Live News), not just this tile.
-    const playAll = () => {
+    // Open the channel's CURRENT live stream in the in-app viewer — reliable,
+    // unlike the eco-paused inline grid. Resolves the live video id first.
+    const openInViewer = async () => {
       trackWebcamSelected(feed.id, feed.city, source);
       this.activeFeed = feed;
       this.savePrefs();
-      playAllLiveMedia();
+      const [{ openCameraViewer }, videoId] = await Promise.all([
+        import('./CameraViewer'),
+        resolveLiveVideoId(feed.channelHandle, feed.fallbackVideoId),
+      ]);
+      openCameraViewer({ title: feed.city, subtitle: feed.country, youtubeId: videoId });
     };
+    playBtn.textContent = t('components.webcams.play') || 'Watch live';
     playBtn.addEventListener('click', (e) => {
       e.stopPropagation();
-      playAll();
+      void openInViewer();
     });
 
-    preview.addEventListener('click', () => playAll());
+    preview.addEventListener('click', () => void openInViewer());
     preview.append(status, title, meta, playBtn);
     container.appendChild(preview);
   }

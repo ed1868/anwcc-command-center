@@ -1634,6 +1634,15 @@ export class MapContainer {
     }
   }
 
+  /** Voice-agent map annotations (lines, areas, markers, labels). DeckGL only. */
+  public setAnnotations(features: GeoJSON.Feature[]): void {
+    if (this.useDeckGL) this.deckGLMap?.setAnnotations(features);
+  }
+
+  public clearAnnotations(): void {
+    if (this.useDeckGL) this.deckGLMap?.clearAnnotations();
+  }
+
   public setRenderPaused(paused: boolean): void {
     if (this.useDeckGL) {
       this.deckGLMap?.setRenderPaused(paused);

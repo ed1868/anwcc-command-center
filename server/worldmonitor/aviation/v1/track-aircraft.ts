@@ -7,6 +7,8 @@ import type {
 import { getRelayBaseUrl, getRelayHeaders } from './_shared';
 import { cachedFetchJson } from '../../../_shared/redis';
 import { isOpenSkyProvider, requiresRedistributableProviders } from '../../../_shared/provider-redistribution';
+import { fetchOpenSkyBboxDirect } from './_direct-opensky';
+import { fetchAdsbLolBbox } from './_direct-adsblol';
 
 // 120s. This TTL was originally sized for the anonymous OpenSky tier's ~10 req/min
 // ceiling; that tier was removed in #6222, so the binding constraint is now the shared
@@ -88,6 +90,16 @@ export async function trackAircraft(
                 const relayBase = getRelayBaseUrl();
                 const isCallsignOnly = !!req.callsign && !req.icao24 && isDegenerateBbox(req);
 
+                // PRIMARY bbox source: adsb.lol (free, no key, broader coverage
+                // than OpenSky's metered tier). Only for real viewport bbox
+                // requests; callsign/icao24 lookups fall through to the relay
+                // paths below. redistributableOnly callers are excluded because
+                // adsb.lol carries the same non-redistributable feeder data.
+                if (!isCallsignOnly && !req.icao24 && !isDegenerateBbox(req) && !redistributableOnly) {
+                    const adsbLol = await fetchAdsbLolBbox(req.swLat, req.swLon, req.neLat, req.neLon);
+                    if (adsbLol.length > 0) return { positions: adsbLol, source: 'opensky' };
+                }
+
                 // For callsign-only searches, try Wingbits first — commercial flights like UAE20
                 // are Wingbits-exclusive and not visible in OpenSky. Trying OpenSky first wastes
                 // time and may return an early hit with no callsign match.
@@ -156,6 +168,14 @@ export async function trackAircraft(
                     // Both relay paths exhausted. A bbox-only request now spends at most
                     // 6s + 6s here. An icao24-only request is also nondegenerate-bbox-gated
                     // so it skips this block entirely and goes straight to its own 8s tier.
+                }
+
+                // No relay configured (local dev / relay-less deploy): go straight to
+                // OpenSky with our own OAuth credentials so the AVIATION layer still
+                // shows live aircraft. Redistribution-restricted callers are excluded.
+                if (!isCallsignOnly && !relayBase && !isDegenerateBbox(req) && !redistributableOnly) {
+                    const direct = await fetchOpenSkyBboxDirect(req.swLat, req.swLon, req.neLat, req.neLon);
+                    if (direct.length > 0) return { positions: direct, source: 'opensky' };
                 }
 
                 // For icao24-only queries, try the OpenSky relay

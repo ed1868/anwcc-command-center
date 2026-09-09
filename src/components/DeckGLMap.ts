@@ -684,6 +684,10 @@ export class DeckGLMap {
   // Country highlight state
   private countryGeoJsonLoaded = false;
   private countryHoverSetup = false;
+
+  // Voice-agent map annotations ("whiteboard the world"): a native maplibre
+  // GeoJSON source, independent of the deck.gl layer pipeline.
+  private annotationData: GeoJSON.FeatureCollection = { type: 'FeatureCollection', features: [] };
   private highlightedCountryCode: string | null = null;
   private hoveredCountryIso2: string | null = null;
   private hoveredCountryName: string | null = null;
@@ -5469,6 +5473,36 @@ export class DeckGLMap {
   }
 
   private async showWebcamClickPopup(webcam: WebcamLeafLike, x: number, y: number): Promise<void> {
+    // Traffic cameras open the in-app live viewer (HLS video / refreshing
+    // snapshot) instead of the Windy popup.
+    if (webcam.category === 'traffic') {
+      const [{ getTrafficCam }, { openCameraViewer }] = await Promise.all([
+        import('@/services/traffic-cams'),
+        import('@/components/CameraViewer'),
+      ]);
+      const cam = getTrafficCam(webcam.webcamId);
+      if (cam) {
+        openCameraViewer({ title: cam.title, subtitle: cam.provider, hls: cam.hls, mp4: cam.mp4, image: cam.image });
+        return;
+      }
+    }
+
+    // City webcams: resolve the channel's current live stream → viewer.
+    if (webcam.category === 'citycam') {
+      const [{ getCityCam }, { openCameraViewer }, { fetchLiveVideoInfo }] = await Promise.all([
+        import('@/services/city-cams'),
+        import('@/components/CameraViewer'),
+        import('@/services/live-news'),
+      ]);
+      const cam = getCityCam(webcam.webcamId);
+      if (cam) {
+        let videoId = cam.fallback;
+        try { const info = await fetchLiveVideoInfo(cam.handle); if (info.videoId) videoId = info.videoId; } catch { /* fallback */ }
+        openCameraViewer({ title: cam.city, subtitle: 'Live webcam', youtubeId: videoId });
+        return;
+      }
+    }
+
     // Remove any existing popup
     this.container.querySelector('.deckgl-webcam-popup')?.remove();
 
@@ -8013,6 +8047,61 @@ export class DeckGLMap {
   private getHighlightRestOpacity(): { fill: number; border: number } {
     const theme = isLightMapTheme(getMapTheme(getMapProvider())) ? 'light' : 'dark';
     return { fill: theme === 'light' ? 0.18 : 0.12, border: 0.5 };
+  }
+
+  // Idempotent, self-healing: adds the annotation source + layers if the style
+  // doesn't have them yet (survives basemap/style swaps, which drop custom
+  // layers). Safe to call before every setData.
+  private ensureAnnotationLayers(): void {
+    const map = this.maplibreMap;
+    if (!map || !map.isStyleLoaded()) return;
+    if (map.getSource('wm-annotations')) return;
+    try {
+      map.addSource('wm-annotations', { type: 'geojson', data: this.annotationData });
+      map.addLayer({
+        id: 'wm-annot-fill', type: 'fill', source: 'wm-annotations',
+        filter: ['==', ['geometry-type'], 'Polygon'],
+        paint: { 'fill-color': ['coalesce', ['get', 'color'], '#f0a63c'] as unknown as string, 'fill-opacity': 0.14 },
+      });
+      map.addLayer({
+        id: 'wm-annot-outline', type: 'line', source: 'wm-annotations',
+        filter: ['==', ['geometry-type'], 'Polygon'],
+        paint: { 'line-color': ['coalesce', ['get', 'color'], '#f0a63c'] as unknown as string, 'line-width': 2, 'line-opacity': 0.9 },
+      });
+      map.addLayer({
+        id: 'wm-annot-line', type: 'line', source: 'wm-annotations',
+        filter: ['==', ['geometry-type'], 'LineString'],
+        paint: { 'line-color': ['coalesce', ['get', 'color'], '#f0a63c'] as unknown as string, 'line-width': 2.5, 'line-opacity': 0.95, 'line-dasharray': [2, 1] },
+      });
+      map.addLayer({
+        id: 'wm-annot-point', type: 'circle', source: 'wm-annotations',
+        filter: ['==', ['geometry-type'], 'Point'],
+        paint: { 'circle-radius': 5, 'circle-color': ['coalesce', ['get', 'color'], '#f0a63c'] as unknown as string, 'circle-stroke-width': 1.5, 'circle-stroke-color': '#ffffff' },
+      });
+      map.addLayer({
+        id: 'wm-annot-label', type: 'symbol', source: 'wm-annotations',
+        layout: { 'text-field': ['coalesce', ['get', 'label'], ''] as unknown as string, 'text-size': 13, 'text-offset': [0, 1.2], 'text-anchor': 'top', 'text-allow-overlap': false },
+        paint: { 'text-color': '#ffd9a0', 'text-halo-color': '#1a1000', 'text-halo-width': 1.6 },
+      });
+    } catch { /* style mid-swap — next call retries */ }
+  }
+
+  /** Replace all map annotations (voice-agent whiteboard). Pass [] to clear. */
+  public setAnnotations(features: GeoJSON.Feature[]): void {
+    this.annotationData = { type: 'FeatureCollection', features };
+    const map = this.maplibreMap;
+    if (map && !map.isStyleLoaded()) {
+      // Style still loading — apply once it's ready so nothing is dropped.
+      map.once('idle', () => this.setAnnotations(this.annotationData.features));
+      return;
+    }
+    this.ensureAnnotationLayers();
+    const src = map?.getSource('wm-annotations');
+    if (src && 'setData' in src) (src as maplibregl.GeoJSONSource).setData(this.annotationData);
+  }
+
+  public clearAnnotations(): void {
+    this.setAnnotations([]);
   }
 
   public highlightCountry(code: string): void {

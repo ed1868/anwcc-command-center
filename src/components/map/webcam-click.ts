@@ -52,9 +52,12 @@ export function resolveWebcamStreamUrl(
   webcam: Pick<WebcamLeafLike, 'webcamId'>,
   image?: { playerUrl?: string; windyUrl?: string } | null,
 ): string | null {
+  const id = webcam.webcamId?.trim();
+  // Traffic cameras carry their live snapshot/video URL directly in webcamId —
+  // open it verbatim rather than routing through Windy.
+  if (id && /^https?:\/\//i.test(id)) return id;
   const fromImage = (image?.windyUrl || '').trim();
   if (fromImage) return fromImage;
-  const id = webcam.webcamId?.trim();
   if (!id) return null;
   return `https://www.windy.com/webcams/${encodeURIComponent(id)}`;
 }
