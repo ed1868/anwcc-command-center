@@ -6,6 +6,8 @@ import type { AppContext } from '@/app/app-context';
 import { applyAgentBusAction } from '@/app/agent-bus-applier';
 import { DASHBOARD_MAP_VIEWS, DASHBOARD_TIME_RANGES } from '../../../shared/agent-bus-contract';
 import { fetchMilitaryFlights, getInterestingFlights, getMilitaryFlightsStatus } from '@/services/military-flights';
+import { fetchMilitaryVessels, getVesselsNearLocation, getDarkVessels } from '@/services/military-vessels';
+import { fetchActiveStorms, fetchWeatherAlerts, fetchCurrentWeather } from './weather';
 import { fetchRecentQuakes } from './usgs-quakes';
 import { setAirTrafficOverlay, isAirTrafficOverlayActive } from './air-traffic';
 import { nextIssPass } from './iss-pass';
@@ -64,9 +66,11 @@ const INSTRUCTIONS = [
   'For requests about a dashboard section ("show me the news panel", "bring up markets"), call open_panel.',
   'For questions like "what am I looking at?" call get_view_state first, then answer from it.',
   'For "what\'s in the air / any military activity" call get_flight_overview. For headlines call get_news_headlines. For earthquakes call get_earthquakes. For "how are the markets" call get_market_summary.',
+  'For WEATHER & STORMS: "any hurricanes / where\'s the storm / active tropical storms" → get_active_storms (offer to fly to one). "Weather warnings / storm alerts near <US place>" → get_weather_alerts with coordinates. "What\'s the weather in <place>" → get_weather. For hurricanes near a place, combine: get_active_storms and note which are near the operator.',
   'For "give me the brief / situation report / brief me / what is happening in the world" call situation_brief, then deliver a crisp spoken mission-control situation report: open with the single most significant item, then move briskly through air, seismic, markets, and conflict hotspots. Synthesize — never read every field. Keep it tight.',
   'For a DEEP-DIVE on a place/conflict/topic — "what\'s happening in the Red Sea?", "situation in Taiwan", "brief me on the Sahel" — call get_hotspot_context with the topic, explain the situation factually from the headlines, and annotate_map the key places as you talk. Then offer to fly there.',
-  'ANALYTICAL questions — counts, biggest/strongest/highest, or nearest over an area — call analyst_query. Pick domain flights|earthquakes|fires. For "near <place>" pass near{lat,lon,radiusKm}; for a named region ("over Texas") pass a bbox you derive yourself. Examples: "how many flights over Texas above 30,000 feet" → domain:flights, bbox for Texas, minAltitudeFt:30000, aggregate:count. "Biggest fire near LA" → domain:fires, near LA, aggregate:extreme. "Strongest quake in Japan this week" → domain:earthquakes, bbox Japan, aggregate:extreme. For a follow-up about the SAME set ("which of those is closest to me?") pass followUp:true with a new near/aggregate. State counts verbatim and name the top few results with their key numbers.',
+  'For SHIP / vessel / maritime questions — "what ships are near Taiwan", "any tankers near Hormuz", "vessels off Gibraltar" — call query_ships_in_area with the location. Report the count, name a few notable vessels (name, type, destination), and flag any "dark" vessels that went silent. Ships = the "ais" map layer; enable it if the operator wants them on the map.',
+  'ANALYTICAL questions — counts, biggest/strongest/highest/fastest, or nearest over an area — call analyst_query. Pick domain flights|earthquakes|fires|ships (ships rank by speed; "closest ship to X" = domain ships, near X, aggregate nearest). For "near <place>" pass near{lat,lon,radiusKm}; for a named region ("over Texas") pass a bbox you derive yourself. Examples: "how many flights over Texas above 30,000 feet" → domain:flights, bbox for Texas, minAltitudeFt:30000, aggregate:count. "Biggest fire near LA" → domain:fires, near LA, aggregate:extreme. "Strongest quake in Japan this week" → domain:earthquakes, bbox Japan, aggregate:extreme. For a follow-up about the SAME set ("which of those is closest to me?") pass followUp:true with a new near/aggregate. State counts verbatim and name the top few results with their key numbers.',
   'For "when can I see the space station / next ISS pass / is the ISS overhead" call next_iss_pass with the location coordinates. Report the local time, how many minutes away, how long it is visible, and how high it climbs (maxElevationDeg — over 40° is a great pass). Convert the UTC time to the operator\'s local time.',
   'For "next rocket launch / upcoming launches / when does SpaceX launch next" call get_rocket_launches. Lead with the soonest, give vehicle + mission + local launch time, and offer to fly to the pad (each has lat/lon).',
   'Always answer counts verbatim from tool results — never estimate or round.',
@@ -242,11 +246,11 @@ const TOOLS: VoiceToolDefinition[] = [
   {
     type: 'function',
     name: 'analyst_query',
-    description: 'Answer an analytical question about live data (flights, earthquakes, or fires) over an area: counts, top/biggest/strongest, or nearest. Supply the area as near{lat,lon,radiusKm} OR a bbox you derive from geography. Use followUp:true to refine the previous result set ("which of those is closest?").',
+    description: 'Answer an analytical question about live data (flights, earthquakes, fires, or ships) over an area: counts, top/biggest/strongest/fastest, or nearest. Supply the area as near{lat,lon,radiusKm} OR a bbox you derive from geography. Use followUp:true to refine the previous result set ("which of those is closest?").',
     parameters: {
       type: 'object',
       properties: {
-        domain: { type: 'string', enum: ['flights', 'earthquakes', 'fires'] },
+        domain: { type: 'string', enum: ['flights', 'earthquakes', 'fires', 'ships'] },
         near: {
           type: 'object',
           properties: { lat: { type: 'number' }, lon: { type: 'number' }, radiusKm: { type: 'number' } },
@@ -262,6 +266,8 @@ const TOOLS: VoiceToolDefinition[] = [
         aircraftType: { type: 'string', description: 'flights: ICAO type filter, e.g. B738' },
         minMagnitude: { type: 'number', description: 'earthquakes: minimum magnitude' },
         minFrp: { type: 'number', description: 'fires: minimum fire radiative power (MW)' },
+        minSpeedKt: { type: 'number', description: 'ships: minimum speed in knots (e.g. >1 = under way)' },
+        vesselType: { type: 'string', description: 'ships: type filter, e.g. cargo, tanker, carrier, fishing' },
         aggregate: { type: 'string', enum: ['count', 'list', 'nearest', 'extreme'], description: '"extreme" = biggest/strongest/highest' },
         limit: { type: 'number' },
         followUp: { type: 'boolean' },
@@ -332,6 +338,21 @@ const TOOLS: VoiceToolDefinition[] = [
   },
   {
     type: 'function',
+    name: 'query_ships_in_area',
+    description: 'Scan live ships/vessels near a location (AIS): count, notable vessels (name, type, speed, destination, flag), and any "dark" vessels that went silent. Use for "what ships are near Taiwan", "any tankers near Hormuz", "vessels off Gibraltar".',
+    parameters: {
+      type: 'object',
+      properties: {
+        lat: { type: 'number' },
+        lon: { type: 'number' },
+        radiusKm: { type: 'number', description: 'default 300' },
+        label: { type: 'string', description: 'area name' },
+      },
+      required: ['lat', 'lon'],
+    },
+  },
+  {
+    type: 'function',
     name: 'show_camera_wall',
     description: 'Open a surveillance WALL — several live city cameras playing at once in a grid. Use for "put X, Y, Z on the wall", "show me these cities side by side", "camera wall of ...". Supply 2–9 places with their coordinates.',
     parameters: {
@@ -363,6 +384,32 @@ const TOOLS: VoiceToolDefinition[] = [
     parameters: {
       type: 'object',
       properties: { limit: { type: 'number', description: 'Max headlines, default 8' } },
+    },
+  },
+  {
+    type: 'function',
+    name: 'get_active_storms',
+    description: 'Active tropical cyclones worldwide (hurricanes, typhoons, tropical storms) from the National Hurricane Center — name, category, wind speed, position, movement. Use for "any hurricanes?", "where\'s the storm?", "active tropical storms".',
+    parameters: { type: 'object', properties: {} },
+  },
+  {
+    type: 'function',
+    name: 'get_weather_alerts',
+    description: 'Active severe-weather alerts near a US location (hurricane/tornado/flood/storm warnings) from the National Weather Service. Use for "any weather warnings near Miami", "storm alerts in Florida".',
+    parameters: {
+      type: 'object',
+      properties: { lat: { type: 'number' }, lon: { type: 'number' }, place: { type: 'string' } },
+      required: ['lat', 'lon'],
+    },
+  },
+  {
+    type: 'function',
+    name: 'get_weather',
+    description: 'Current weather conditions at a location (temperature, feels-like, wind, gusts, conditions). Use for "what\'s the weather in <place>".',
+    parameters: {
+      type: 'object',
+      properties: { lat: { type: 'number' }, lon: { type: 'number' }, place: { type: 'string' } },
+      required: ['lat', 'lon'],
     },
   },
   {
@@ -781,6 +828,37 @@ export function createVoiceActionRegistry(ctx: AppContext): VoiceActionRegistry 
       };
     },
 
+    async query_ships_in_area({ lat, lon, radiusKm, label }) {
+      if (typeof lat !== 'number' || typeof lon !== 'number') {
+        return { ok: false, error: 'Missing coordinates' };
+      }
+      await fetchMilitaryVessels().catch(() => null); // ensure the snapshot is warm
+      const radius = typeof radiusKm === 'number' && radiusKm > 0 ? Math.min(radiusKm, 2000) : 300;
+      const radiusDeg = radius / 111;
+      const near = getVesselsNearLocation(lat, lon, radiusDeg);
+      const byDist = near
+        .map((v) => ({ v, distKm: Math.round(Math.hypot(v.lat - lat, v.lon - lon) * 111) }))
+        .filter((x) => x.distKm <= radius)
+        .sort((a, b) => a.distKm - b.distKm);
+      const dark = getDarkVessels().filter((v) => Math.hypot(v.lat - lat, v.lon - lon) * 111 <= radius);
+      return {
+        ok: true,
+        area: label || `${lat.toFixed(2)}, ${lon.toFixed(2)}`,
+        radiusKm: radius,
+        count: byDist.length,
+        vessels: byDist.slice(0, 12).map(({ v, distKm }) => ({
+          name: v.name || v.mmsi,
+          type: v.aisShipType || v.vesselType,
+          flag: v.operatorCountry,
+          speedKt: Math.round(v.speed),
+          destination: v.destination || null,
+          distanceKm: distKm,
+        })),
+        darkVessels: dark.slice(0, 5).map((v) => ({ name: v.name || v.mmsi, type: v.aisShipType || v.vesselType, silentForMin: v.aisGapMinutes ?? null })),
+        note: 'Coverage is the tracked AIS vessel set (military + notable civilian). "Dark" vessels have stopped broadcasting AIS — flag them as noteworthy.',
+      };
+    },
+
     async show_camera_wall({ cameras }) {
       const reqs = Array.isArray(cameras) ? cameras as Array<{ lat: number; lon: number; label?: string }> : [];
       const valid = reqs.filter((c) => typeof c.lat === 'number' && typeof c.lon === 'number').slice(0, 9);
@@ -872,6 +950,24 @@ export function createVoiceActionRegistry(ctx: AppContext): VoiceActionRegistry 
         locationsFound: locations,
         note: 'Explain the situation from these headlines — synthesize a factual 2–4 sentence read, do not list every one. Then call annotate_map to mark the key places you mention (supply coordinates from your own geography knowledge). If matchCount is 0, say the feeds have nothing specific right now and answer from your own knowledge.',
       };
+    },
+
+    async get_active_storms() {
+      const storms = await fetchActiveStorms();
+      return { ok: true, count: storms.length, storms, note: storms.length ? 'Each storm has lat/lon — offer to fly to one. Lead with the strongest/nearest to the operator.' : 'No active tropical cyclones right now.' };
+    },
+
+    async get_weather_alerts({ lat, lon, place }) {
+      if (typeof lat !== 'number' || typeof lon !== 'number') return { ok: false, error: 'Missing coordinates' };
+      const alerts = await fetchWeatherAlerts(lat, lon);
+      return { ok: true, place: place || `${lat.toFixed(2)}, ${lon.toFixed(2)}`, count: alerts.length, alerts, note: alerts.length ? 'Lead with the most severe (Extreme/Severe). US coverage only.' : 'No active weather alerts at that location (US coverage only).' };
+    },
+
+    async get_weather({ lat, lon, place }) {
+      if (typeof lat !== 'number' || typeof lon !== 'number') return { ok: false, error: 'Missing coordinates' };
+      const wx = await fetchCurrentWeather(lat, lon);
+      if (!wx) return { ok: false, error: 'Weather unavailable' };
+      return { ok: true, place: place || `${lat.toFixed(2)}, ${lon.toFixed(2)}`, ...wx };
     },
 
     async get_earthquakes({ minMagnitude }) {

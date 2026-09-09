@@ -5,8 +5,9 @@
 // is closest?") refine it instead of re-fetching.
 
 import { fetchRecentQuakes } from './usgs-quakes';
+import { fetchMilitaryVessels } from '@/services/military-vessels';
 
-export type AnalystDomain = 'flights' | 'earthquakes' | 'fires';
+export type AnalystDomain = 'flights' | 'earthquakes' | 'fires' | 'ships';
 export type AnalystAggregate = 'count' | 'list' | 'nearest' | 'extreme';
 
 export interface AnalystQuery {
@@ -18,6 +19,8 @@ export interface AnalystQuery {
   aircraftType?: string;
   minMagnitude?: number;
   minFrp?: number;
+  minSpeedKt?: number;
+  vesselType?: string;
   aggregate?: AnalystAggregate;
   limit?: number;
   followUp?: boolean;
@@ -107,7 +110,21 @@ async function fetchFires(box: { south: number; north: number; west: number; eas
     }));
 }
 
-const RANK_NAME: Record<AnalystDomain, string> = { flights: 'altitude (ft)', earthquakes: 'magnitude', fires: 'fire power (MW)' };
+async function fetchShips(box: { south: number; north: number; west: number; east: number }, q: AnalystQuery): Promise<AnalystItem[]> {
+  const snap = await fetchMilitaryVessels().catch(() => ({ vessels: [] as Awaited<ReturnType<typeof fetchMilitaryVessels>>['vessels'] }));
+  const typeFilter = q.vesselType?.toLowerCase();
+  return (snap.vessels ?? [])
+    .filter((v) => v.lat >= box.south && v.lat <= box.north && v.lon >= box.west && v.lon <= box.east
+      && (q.minSpeedKt == null || v.speed >= q.minSpeedKt)
+      && (!typeFilter || `${v.aisShipType ?? ''} ${v.vesselType}`.toLowerCase().includes(typeFilter)))
+    .map((v) => ({
+      label: v.name || v.mmsi,
+      lat: v.lat, lon: v.lon, rank: v.speed,
+      detail: { type: v.aisShipType || v.vesselType, speedKt: Math.round(v.speed), destination: v.destination ?? null, country: v.operatorCountry, mmsi: v.mmsi },
+    }));
+}
+
+const RANK_NAME: Record<AnalystDomain, string> = { flights: 'altitude (ft)', earthquakes: 'magnitude', fires: 'fire power (MW)', ships: 'speed (kt)' };
 
 export async function runAnalystQuery(q: AnalystQuery): Promise<Record<string, unknown>> {
   const box = resolveBbox(q);
@@ -126,6 +143,7 @@ export async function runAnalystQuery(q: AnalystQuery): Promise<Record<string, u
   } else if (box) {
     if (q.domain === 'flights') items = await fetchFlights(box, q);
     else if (q.domain === 'earthquakes') items = await fetchQuakes(box, q);
+    else if (q.domain === 'ships') items = await fetchShips(box, q);
     else items = await fetchFires(box, q);
     center = box.center;
     scopeLabel = q.near ? `within ${q.near.radiusKm ?? 200} km of ${q.near.lat.toFixed(2)}, ${q.near.lon.toFixed(2)}` : 'in the requested area';

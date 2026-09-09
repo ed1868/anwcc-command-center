@@ -1315,6 +1315,59 @@ function launchesPlugin(): Plugin {
   };
 }
 
+// Dev-only weather proxy (all free / no key): NHC active tropical cyclones,
+// NWS severe-weather alerts (needs a descriptive User-Agent), and Open-Meteo
+// current conditions. `?kind=storms|alerts|current`.
+function weatherPlugin(): Plugin {
+  const UA = '(anwcc-command-center, self-host)';
+  let stormCache: { body: string; expiresAt: number } | null = null;
+  return {
+    name: 'weather',
+    configureServer(server) {
+      server.middlewares.use('/api/weather', async (req, res) => {
+        res.setHeader('Content-Type', 'application/json');
+        res.setHeader('Cache-Control', 'no-store');
+        try {
+          const url = new URL(req.url || '', 'http://localhost');
+          const kind = url.searchParams.get('kind') || 'storms';
+          const lat = url.searchParams.get('lat');
+          const lon = url.searchParams.get('lon');
+
+          if (kind === 'storms') {
+            if (stormCache && stormCache.expiresAt > performance.now()) { res.end(stormCache.body); return; }
+            const r = await fetch('https://www.nhc.noaa.gov/CurrentStorms.json', { headers: { 'User-Agent': UA }, signal: AbortSignal.timeout(12_000) });
+            if (!r.ok) { res.statusCode = 502; res.end(JSON.stringify({ error: `NHC HTTP ${r.status}`, activeStorms: [] })); return; }
+            const body = await r.text();
+            stormCache = { body, expiresAt: performance.now() + 10 * 60_000 };
+            res.end(body);
+            return;
+          }
+          if (kind === 'alerts') {
+            const area = url.searchParams.get('area');
+            const q = area ? `area=${encodeURIComponent(area)}` : (lat && lon ? `point=${encodeURIComponent(`${lat},${lon}`)}` : '');
+            const r = await fetch(`https://api.weather.gov/alerts/active?${q}`, { headers: { 'User-Agent': UA, Accept: 'application/geo+json' }, signal: AbortSignal.timeout(12_000) });
+            if (!r.ok) { res.statusCode = 502; res.end(JSON.stringify({ error: `NWS HTTP ${r.status}`, features: [] })); return; }
+            res.end(await r.text());
+            return;
+          }
+          if (kind === 'current') {
+            if (!lat || !lon) { res.statusCode = 400; res.end(JSON.stringify({ error: 'lat/lon required' })); return; }
+            const r = await fetch(`https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&current=temperature_2m,relative_humidity_2m,apparent_temperature,wind_speed_10m,wind_gusts_10m,weather_code&wind_speed_unit=kn&temperature_unit=fahrenheit`, { signal: AbortSignal.timeout(10_000) });
+            if (!r.ok) { res.statusCode = 502; res.end(JSON.stringify({ error: `Open-Meteo HTTP ${r.status}` })); return; }
+            res.end(await r.text());
+            return;
+          }
+          res.statusCode = 400;
+          res.end(JSON.stringify({ error: 'unknown kind' }));
+        } catch (error) {
+          res.statusCode = 502;
+          res.end(JSON.stringify({ error: error instanceof Error ? error.message : 'weather failed' }));
+        }
+      });
+    },
+  };
+}
+
 export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, process.cwd(), '');
   // Inject environment variables from .env files into process.env.
@@ -1367,6 +1420,7 @@ export default defineConfig(({ mode }) => {
       issTlePlugin(),
       trafficCamsPlugin(),
       launchesPlugin(),
+      weatherPlugin(),
       // Ship readable dashboard stack traces to Sentry. Without this every
       // browser frame arrives minified (`Rs.loadNews`, `BO`, `v`), which is why
       // triage has had to infer call sites from Vite chunk names.
