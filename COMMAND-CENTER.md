@@ -53,8 +53,9 @@ dev-only proxies; they don't exist in a production build.
 | **Fires** | NASA FIRMS (seeded to Redis) | `NASA_FIRMS_API_KEY` |
 | **Satellites** | CelesTrak / intelligence RPC | none |
 | **ISS pass** | CelesTrak TLE + satellite.js | none |
-| **Traffic cameras** | Caltrans (CA) + TfL (London) | none |
-| **City webcams** | curated YouTube live streams | none |
+| **Traffic cameras** | Caltrans (CA, live HLS video) + Florida DOT (live snapshots) + TfL (London) | none |
+| **City webcams** | curated YouTube live channels (Kyiv, Rome, NYC, Chicago, Miami, Key West, Taipei, Tokyo, Sydney) | none |
+| **Rocket launches** | The Space Devs Launch Library 2 | none |
 | **Markets / crypto** | seeded by the relay | `FINNHUB_API_KEY` etc. |
 
 **Wingbits** (extra commercial flight coverage) is wired but its API key is
@@ -65,17 +66,49 @@ want it. Everything else works without it.
 
 ## Talking to Jarvis
 
-Click **VOICE** in the header, allow the mic, and just talk. Examples:
+Click **VOICE** in the header, allow the mic, and just talk — **no wake word**.
+Jarvis is always-listening (OpenAI Realtime over WebRTC), supports **barge-in**
+(interrupt it and it stops to listen), streams a **live transcript**, and shows
+an **amber particle-core HUD** while it listens, thinks, and speaks. Examples:
 
-- *"What flights are over Florida right now?"* — count + airline, aircraft type, and route, then offers to fly you there
-- *"Show me all air traffic"* — live planes on the map
-- *"Show me traffic cameras in LA"* — thousands of freeway cams as clickable markers
-- *"Show me Tokyo live"* — opens a city webcam
-- *"When's the next ISS pass over Miami?"*
-- *"Any big earthquakes today?"* · *"How are the markets?"* · *"Focus on Iran"*
-- *"What can you do?"* — Jarvis lists its own capabilities
+**Map & navigation**
+- *"Zoom to Taiwan"* · *"Focus on Iran"* · *"Continental view of Europe"*
+- *"Take me to street level in Miami"* — district/street-level zoom
 
-Needs `OPENAI_API_KEY` in `.env.local`.
+**Aircraft**
+- *"What flights are over Florida right now?"* — count + aircraft type, tail
+  number, and from→to route for notable flights, then offers to fly you there
+- *"Show me all air traffic"* — every live transponder on the map
+- *"What's the military picture?"* — tracked military aircraft
+
+**Analyst engine**
+- *"How many flights over Texas above 30,000 feet?"*
+- *"Biggest fire near LA?"* · *"Strongest quake in Japan today?"*
+- Follow-up: *"Which of those is closest?"* — refines the previous result set
+
+**Live cameras**
+- *"Watch Miami"* · *"Show me Tokyo live"* — opens the nearest live city webcam
+- *"Put Miami, Times Square, and Tokyo on the wall"* — a multi-camera surveillance grid
+- *"Show me traffic cameras in LA"* — thousands of CA/FL/London traffic cams as clickable markers
+
+**Intelligence**
+- *"Give me the brief"* — a spoken cross-domain situation report
+- *"What's happening in the Red Sea?"* — live news + explanation + map annotation
+- *"Outline Taiwan"* · *"Draw a line from Kyiv to Moscow"* — Jarvis draws as it talks
+
+**Space**
+- *"When's the next ISS pass over Miami?"* · *"When's the next rocket launch?"*
+
+**Proactive watch mode**
+- While connected, Jarvis alerts you unprompted (spoken + on-screen toast) to
+  major earthquakes (M5+) and breaking news. Say *"stop watching"* to pause it.
+
+**Anything else**
+- *"How are the markets?"* · *"Any big earthquakes today?"* · *"Latest headlines"*
+- *"What can you do?"* — Jarvis lists its own capabilities live
+
+Needs `OPENAI_API_KEY` in `.env.local`. Full capability reference:
+[`docs/FEATURES.md`](docs/FEATURES.md).
 
 ---
 

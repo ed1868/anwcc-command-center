@@ -1,222 +1,182 @@
 # Ai Nomads World Command Center
 
-**A real-time global intelligence command center** — live conflicts, markets, military and civil aviation, maritime AIS, camera feeds, infrastructure, and OSINT signals fused into one situational-awareness workspace, with the **Jarvis** voice agent on top.
+**A real-time global intelligence command center — driven by your voice.** Live
+conflicts, markets, civil and military aviation, maritime AIS, live camera
+feeds, space, earthquakes, fires, and OSINT signals fused into one
+situational-awareness workspace, with the **Jarvis** realtime voice agent on
+top. Talk to it and the world map responds.
 
-Built and maintained by Eddie Ruiz ([@ed1868](https://github.com/ed1868)), the Command Center extends the open-source intelligence dashboard with a custom **Jarvis voice agent** (hands-free briefings and control), **live flight tracking**, **live camera feeds**, and an integrated **AI analyst** for on-demand synthesis across every data stream.
+Built and maintained by **Eddie Ruiz** ([@ed1868](https://github.com/ed1868)),
+the Command Center extends the open-source intelligence dashboard with a custom
+**Jarvis voice agent** (hands-free briefings and control), **live flight
+tracking**, **live camera walls**, an integrated **AI analyst engine**, and
+**proactive watch mode** across every data stream.
 
-> Built on the open-source [worldmonitor](https://github.com/koala73/worldmonitor) project (AGPL-3.0). This is a derivative work; see [`NOTICE.md`](NOTICE.md) and [`LICENSE`](LICENSE).
+> Built on the open-source [worldmonitor](https://github.com/koala73/worldmonitor)
+> project by Elie Habib and contributors (AGPL-3.0). This is a derivative work;
+> see [`NOTICE.md`](NOTICE.md) and [`LICENSE`](LICENSE).
 
-[简体中文](README.zh-CN.md) | [日本語](README.ja-JP.md)
-
-[![GitHub stars](https://img.shields.io/github/stars/koala73/worldmonitor?style=social)](https://github.com/koala73/worldmonitor/stargazers)
-[![Discord](https://img.shields.io/badge/Discord-Join-5865F2?style=flat&logo=discord&logoColor=white)](https://discord.gg/re63kWKxaz)
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL%20v3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
 [![TypeScript](https://img.shields.io/badge/TypeScript-007ACC?style=flat&logo=typescript&logoColor=white)](https://www.typescriptlang.org/)
-[![Last commit](https://img.shields.io/github/last-commit/koala73/worldmonitor)](https://github.com/koala73/worldmonitor/commits/main)
-[![Latest release](https://img.shields.io/github/v/release/koala73/worldmonitor?style=flat)](https://github.com/koala73/worldmonitor/releases/latest)
-[![npm: worldmonitor](https://img.shields.io/npm/v/worldmonitor?logo=npm&label=npm)](https://www.npmjs.com/package/worldmonitor)
-[![skills.sh](https://skills.sh/b/koala73/worldmonitor)](https://skills.sh/koala73/worldmonitor)
+[![Voice: OpenAI Realtime](https://img.shields.io/badge/Voice-OpenAI%20Realtime%20(WebRTC)-10a37f?style=flat)](https://platform.openai.com/docs/guides/realtime)
 
-<p align="center">
-  <a href="https://www.worldmonitor.app"><img src="https://img.shields.io/badge/Web_App-worldmonitor.app-blue?style=for-the-badge&logo=googlechrome&logoColor=white" alt="Web App"></a>&nbsp;
-  <a href="https://tech.worldmonitor.app"><img src="https://img.shields.io/badge/Tech_Variant-tech.worldmonitor.app-0891b2?style=for-the-badge&logo=googlechrome&logoColor=white" alt="Tech Variant"></a>&nbsp;
-  <a href="https://finance.worldmonitor.app"><img src="https://img.shields.io/badge/Finance_Variant-finance.worldmonitor.app-059669?style=for-the-badge&logo=googlechrome&logoColor=white" alt="Finance Variant"></a>&nbsp;
-  <a href="https://commodity.worldmonitor.app"><img src="https://img.shields.io/badge/Commodity_Variant-commodity.worldmonitor.app-b45309?style=for-the-badge&logo=googlechrome&logoColor=white" alt="Commodity Variant"></a>&nbsp;
-  <a href="https://happy.worldmonitor.app"><img src="https://img.shields.io/badge/Happy_Variant-happy.worldmonitor.app-f59e0b?style=for-the-badge&logo=googlechrome&logoColor=white" alt="Happy Variant"></a>&nbsp;
-  <a href="https://energy.worldmonitor.app"><img src="https://img.shields.io/badge/Energy_Variant-energy.worldmonitor.app-eab308?style=for-the-badge&logo=googlechrome&logoColor=white" alt="Energy Variant"></a>
-</p>
-
-<p align="center">
-  <a href="https://www.npmjs.com/package/worldmonitor"><img src="https://img.shields.io/npm/v/worldmonitor?style=for-the-badge&logo=npm&logoColor=white&label=npm%20i%20worldmonitor&color=CB3837" alt="npm i worldmonitor"></a>&nbsp;
-  <a href="https://www.npmjs.com/package/worldmonitor"><img src="https://img.shields.io/badge/CLI-npx%20worldmonitor-CB3837?style=for-the-badge&logo=npm&logoColor=white" alt="npx worldmonitor"></a>&nbsp;
-  <a href="https://pypi.org/project/worldmonitor-sdk/"><img src="https://img.shields.io/pypi/v/worldmonitor-sdk?style=for-the-badge&logo=pypi&logoColor=white&label=pip%20install%20worldmonitor-sdk&color=3775A9" alt="pip install worldmonitor-sdk"></a>&nbsp;
-  <a href="https://rubygems.org/gems/worldmonitor"><img src="https://img.shields.io/gem/v/worldmonitor?style=for-the-badge&logo=rubygems&logoColor=white&label=gem%20install%20worldmonitor&color=E9573F" alt="gem install worldmonitor"></a>&nbsp;
-  <a href="https://pkg.go.dev/github.com/koala73/worldmonitor/sdk/go"><img src="https://img.shields.io/badge/go%20get-sdk%2Fgo-00ADD8?style=for-the-badge&logo=go&logoColor=white" alt="go get github.com/koala73/worldmonitor/sdk/go"></a>
-</p>
-
-<p align="center">
-  <a href="https://www.worldmonitor.app/api/download?platform=windows-exe"><img src="https://img.shields.io/badge/Download-Windows_(.exe)-0078D4?style=for-the-badge&logo=windows&logoColor=white" alt="Download Windows"></a>&nbsp;
-  <a href="https://www.worldmonitor.app/api/download?platform=macos-arm64"><img src="https://img.shields.io/badge/Download-macOS_Apple_Silicon-000000?style=for-the-badge&logo=apple&logoColor=white" alt="Download macOS ARM"></a>&nbsp;
-  <a href="https://www.worldmonitor.app/api/download?platform=macos-x64"><img src="https://img.shields.io/badge/Download-macOS_Intel-555555?style=for-the-badge&logo=apple&logoColor=white" alt="Download macOS Intel"></a>&nbsp;
-  <a href="https://www.worldmonitor.app/api/download?platform=linux-appimage"><img src="https://img.shields.io/badge/Download-Linux_(.AppImage)-FCC624?style=for-the-badge&logo=linux&logoColor=black" alt="Download Linux"></a>
-</p>
-
-<p align="center">
-  <a href="https://www.worldmonitor.app/docs/documentation"><strong>Documentation</strong></a> &nbsp;·&nbsp;
-  <a href="https://github.com/koala73/worldmonitor/releases/latest"><strong>Releases</strong></a> &nbsp;·&nbsp;
-  <a href="https://www.worldmonitor.app/docs/contributing"><strong>Contributing</strong></a>
-</p>
-
-![World Monitor Dashboard](docs/images/worldmonitor-7-mar-2026.jpg)
+![The Jarvis particle core while speaking](docs/screenshots/jarvis-core.png)
 
 ---
 
-## What It Does
+## Meet Jarvis
 
-- **Curated news feeds** across global and regional categories, AI-synthesized into briefs
-- **Dual map engine** — 3D globe (globe.gl) and WebGL flat map (deck.gl) with a shared map-layer catalog
-- **Panel inventory** — concrete panel implementations across specialized variants
-- **Cross-stream correlation** — military, economic, disaster, and escalation signal convergence
-- **[Country Instability Index (CII)](https://www.worldmonitor.app/country-instability-index/)** — live CII v8 scores, bands, and approximate 24-hour movement for 31 Tier-1 countries
-- **Finance radar** — stock exchanges, commodities, crypto, and a market composite
-- **Local AI** — run everything with Ollama, no API keys required
-- **Site variants** from a single codebase (world, tech, finance, commodity, happy, energy)
-- **Native desktop app** (Tauri 2) for macOS, Windows, and Linux
-- **Multilingual UI** with native-language feeds and RTL support
+Jarvis is an **always-listening realtime voice agent** built on the **OpenAI
+Realtime API over WebRTC**. Click **VOICE** in the header, allow the mic, and
+just talk — **no wake word**. It responds in a natural voice, supports
+**barge-in** (interrupt it mid-sentence and it stops to listen), streams a
+**live transcript**, and renders an **amber particle-core HUD** that pulses as
+it listens, thinks, and speaks.
 
-For the full feature list, architecture, data sources, and algorithms, see the **[documentation](https://www.worldmonitor.app/docs/documentation)**.
+Jarvis doesn't just answer — it *drives the command center*. Ask a question and
+it flies the map, opens panels, draws annotations, spins up camera walls, and
+alerts you to breaking events without being asked.
+
+### Talk to it
+
+Everything below is a real command wired into Jarvis's tool surface:
+
+**Move the map**
+- *"Zoom to Taiwan."* · *"Focus on Iran."* · *"Show me a continental view of Europe."*
+- *"Take me to street level in Miami."* (zooms to district / street detail)
+
+**Aircraft**
+- *"What flights are over Florida right now?"* — count, plus callsign, aircraft
+  type, tail number, and from→to route for notable flights; then offers to fly you there.
+- *"Show me all air traffic."* — every live transponder in view, refreshing continuously.
+- *"What's the military picture?"* — tracked military aircraft.
+
+**Analyst engine**
+- *"How many flights over Texas above 30,000 feet?"*
+- *"What's the biggest fire near LA?"* · *"Strongest quake in Japan today?"*
+- Follow up: *"Which of those is closest?"* — it refines the previous result set.
+
+**Live cameras**
+- *"Watch Miami."* · *"Show me Tokyo live."* — opens the nearest live city webcam.
+- *"Put Miami, Times Square, and Tokyo on the wall."* — a multi-camera surveillance grid.
+- *"Show traffic cams in LA."* — thousands of California/Florida/London public
+  traffic cameras as clickable map markers (California plays continuous live video).
+
+**Intelligence**
+- *"Give me the brief."* — a spoken cross-domain situation report.
+- *"What's happening in the Red Sea?"* — pulls live news, explains it, and annotates the map.
+- *"Outline Taiwan."* · *"Draw a line from Kyiv to Moscow."* — Jarvis draws on the map as it talks.
+
+**Space**
+- *"When's the next ISS pass over Miami?"* · *"When's the next rocket launch?"*
+
+**Watch mode (proactive)**
+- While connected, Jarvis proactively alerts you — spoken and as an on-screen
+  toast — to major earthquakes (M5+) and breaking-news alerts. Say *"stop
+  watching"* to pause it, *"keep an eye out"* to resume.
+
+**Everything else**
+- *"How are the markets?"* · *"Any big earthquakes today?"* · *"Latest headlines."*
+- Toggle data layers: satellites, ships (AIS), fires, conflicts, nuclear sites,
+  undersea cables, datacenters, and more.
+- *"What can you do?"* — Jarvis enumerates its own capabilities live.
+
+See **[docs/FEATURES.md](docs/FEATURES.md)** for the complete capability
+reference, example commands, and data-source notes.
 
 ---
 
-## Support Status
+## Features at a glance
 
-All site variants and desktop binaries are built from a single codebase and ship from the same release process. The table below clarifies maintenance status so you know which surfaces are safe to depend on.
+| Capability | What it does | Ask Jarvis |
+|---|---|---|
+| **Jarvis voice agent** | Always-listening OpenAI Realtime voice with barge-in, live transcript, and an amber particle-core HUD | *"What can you do?"* |
+| **Map control** | Fly to any place, street-level zoom, continental presets, country focus | *"Zoom to Taiwan"* |
+| **Live flights** | All aircraft via adsb.lol — callsign, type, tail number, from→to route; military picture | *"What flights are over Florida?"* |
+| **Analyst engine** | Counts, extremes, and nearest over flights / quakes / fires, with follow-ups | *"Biggest fire near LA?"* |
+| **Live city cameras** | Nearest live webcam, or a multi-camera surveillance wall | *"Put Miami and Tokyo on the wall"* |
+| **Traffic cameras** | Thousands of CA / FL / London public traffic cams as map markers | *"Show traffic cams in LA"* |
+| **Situation brief** | Spoken cross-domain intelligence report | *"Give me the brief"* |
+| **Conflict deep-dive** | Live news + explanation + map annotation for any hotspot | *"What's happening in the Red Sea?"* |
+| **Map annotations** | Outline countries, drop markers, draw lines/arrows while talking | *"Outline Taiwan"* |
+| **Watch mode** | Proactive spoken + on-screen alerts for major quakes and breaking news | *"Stop watching"* |
+| **Space** | Next ISS pass over a place; upcoming rocket launches | *"Next ISS pass over Miami"* |
+| **Data layers** | Satellites, ships (AIS), fires (NASA FIRMS), conflicts, nuclear, cables, datacenters | *"Show me the satellites"* |
+| **Markets & news** | Live indices, commodities, crypto, and the news feed | *"How are the markets?"* |
 
-| Surface | Status | Notes |
-|---------|--------|-------|
-| `worldmonitor.app`, `tech.`, `finance.`, `commodity.`, `happy.`, `energy.` | Stable | Public deployments built from this repo, actively maintained |
-| Desktop binaries (Windows / macOS Apple Silicon / macOS Intel / Linux AppImage) | Stable | One Tauri binary for every variant — install World Monitor and switch to tech, finance, commodity, energy, or happy in-app. There is deliberately no per-variant download |
-
-Issues filed against any of the above are triaged from the same backlog — see the [issues board](https://github.com/koala73/worldmonitor/issues) for currently-open work.
+![Live aircraft over a region](docs/screenshots/flights.png)
 
 ---
 
-## Quick Start
+## Quick start
+
+**Prerequisites:** Docker Desktop, Node 20+, and an `OPENAI_API_KEY` (for Jarvis).
 
 ```bash
-git clone https://github.com/koala73/worldmonitor.git
-cd worldmonitor
+git clone https://github.com/ed1868/anwcc-command-center.git
+cd anwcc-command-center
 npm install
-npm run dev
+
+# Recreate the two gitignored env files (see "Environment" below):
+#   .env.local  — app + seeder keys (OPENAI_API_KEY, etc.) + Docker wiring
+#   .env        — Docker Compose secrets
+
+./scripts/dev-up.sh        # or: make up
 ```
 
-Open [localhost:3000](http://localhost:3000) (override the port with `DEV_PORT` in `.env.local`). The app runs with no environment variables.
+Then open **http://localhost:3100**, click **VOICE**, allow the mic, and start talking.
 
-Feature-specific data sources may require credentials. See `.env.example` for the full list.
+`./scripts/dev-up.sh` starts Docker Desktop if needed, brings up the backend
+containers (Redis + AIS relay), seeds fire data in the background, and launches
+the app. Stop everything with `./scripts/dev-down.sh` (or `make down`).
 
-For variant-specific development:
+For the full local runbook — what runs where, the container topology, and
+troubleshooting — see **[COMMAND-CENTER.md](COMMAND-CENTER.md)**.
 
-```bash
-npm run dev:tech       # tech.worldmonitor.app
-npm run dev:finance    # finance.worldmonitor.app
-npm run dev:commodity  # commodity.worldmonitor.app
-npm run dev:happy      # happy.worldmonitor.app
-npm run dev:energy     # energy.worldmonitor.app
-```
+### Environment
 
-See the **[self-hosting guide](https://www.worldmonitor.app/docs/getting-started)** for deployment options (Vercel, Docker, static).
+Both `.env.local` and `.env` are gitignored and must be recreated on a new
+machine. Generate secrets with `openssl rand -hex 32`.
 
----
+- **`.env.local`** — `OPENAI_API_KEY` (Jarvis), plus optional data keys
+  (OpenSky, NASA FIRMS, AISStream, Finnhub, …) and the Docker wiring block
+  (`WS_RELAY_URL`, `UPSTASH_REDIS_REST_URL`, …).
+- **`.env`** — Docker Compose secrets (`REDIS_TOKEN`, `REDIS_PASSWORD`,
+  `WM_SESSION_SECRET`, `RELAY_SHARED_SECRET`) plus any flight/data keys the
+  relay needs.
 
-## Tech Stack
-
-| Category | Technologies |
-|----------|-------------|
-| **Frontend** | Vanilla TypeScript, Vite, globe.gl + Three.js, deck.gl + MapLibre GL |
-| **Desktop** | Tauri 2 (Rust) with Node.js sidecar |
-| **AI/ML** | Ollama / Groq / OpenRouter, Transformers.js (browser-side) |
-| **API Contracts** | Protocol Buffers and sebuf HTTP annotations |
-| **Deployment** | Vercel Edge Functions, Railway relay, Tauri, PWA |
-| **Caching** | Redis (Upstash), 3-tier cache, CDN, service worker |
-
-Full stack details in the **[architecture docs](https://www.worldmonitor.app/docs/architecture)**.
+Only `OPENAI_API_KEY` is required to talk to Jarvis; most map layers work with
+no keys at all. See `.env.example` for the full list.
 
 ---
 
-## Programmatic Access
+## Under the hood
 
-World Monitor is built for agents and scripts as well as browsers:
-
-- **MCP server** — `https://worldmonitor.app/mcp` (Streamable HTTP). Public `tools/list`; `tools/call` authenticates with a `X-WorldMonitor-Key` header or OAuth.
-  The server also publishes its Agent Skills through the draft `io.modelcontextprotocol/skills` extension (`skills/list`, `skills/get`, and `skill://…` resource reads).
-- **REST API** — base `https://api.worldmonitor.app`, described by the [OpenAPI spec](https://worldmonitor.app/openapi.yaml).
-- **CLI** — the official [`worldmonitor`](https://www.npmjs.com/package/worldmonitor) npm package (source in [`cli/`](cli/)):
-
-  ```sh
-  npx worldmonitor tools          # run ad-hoc — list every MCP tool (no key needed)
-  npm install -g worldmonitor     # or install the `worldmonitor` (alias `wm`) command
-  worldmonitor risk IR --api-key wm_xxx
-  ```
-
-- **SDKs** — official zero-dependency client libraries mirroring the CLI: Python [`worldmonitor-sdk`](https://pypi.org/project/worldmonitor-sdk/) (source in [`sdk/python/`](sdk/python/)), Ruby [`worldmonitor`](https://rubygems.org/gems/worldmonitor) ([`sdk/ruby/`](sdk/ruby/)), Go [`github.com/koala73/worldmonitor/sdk/go`](https://pkg.go.dev/github.com/koala73/worldmonitor/sdk/go) ([`sdk/go/`](sdk/go/)). Guide: [worldmonitor.app/docs/sdks](https://www.worldmonitor.app/docs/sdks).
-
-Agent discovery files: [`llms.txt`](https://worldmonitor.app/llms.txt) · [agent-skills manifest](https://worldmonitor.app/.well-known/agent-skills/index.json) · [api-catalog](https://worldmonitor.app/.well-known/api-catalog). Get an API key at [worldmonitor.app/pro](https://www.worldmonitor.app/pro).
+- **Voice** — `src/services/voice/` : `realtime.ts` (WebRTC session, barge-in,
+  transcript), `actions.ts` (the full tool surface Jarvis calls), plus
+  `analyst.ts`, `air-traffic.ts`, `watch-mode.ts`, `iss-pass.ts`. The HUD lives
+  in `src/components/JarvisOverlay.ts`; camera UI in `CameraViewer.ts` /
+  `CameraWall.ts`.
+- **Dev proxies** — the app reaches live upstreams through Vite dev middleware
+  (see `vite.config.ts`): `realtime-token` (ephemeral OpenAI token),
+  `adsblol` + `opensky` (flights), `route-lookup` (from→to), `iss-tle`,
+  `traffic-cams` (Caltrans + Florida DOT + TfL), and `rocket-launches`. These
+  are dev-only and don't exist in a production build.
+- **Backend** — a Docker Compose stack (`docker-compose.yml`) runs Redis, an
+  Upstash-compatible Redis-REST front, and the AIS relay (ships + market/crypto
+  seeding). One command (`./scripts/dev-up.sh`) brings it all up.
 
 ---
 
-## Flight Data
+## License & attribution
 
-Flight data provided graciously by [Wingbits](https://wingbits.com?utm_source=worldmonitor&utm_medium=referral&utm_campaign=worldmonitor), the most advanced ADS-B flight data solution.
+**AGPL-3.0-only.** The Ai Nomads World Command Center is a derivative work of
+the open-source [worldmonitor](https://github.com/koala73/worldmonitor) project
+by Elie Habib and contributors, distributed under the same license. Under the
+AGPL (§13), users who interact with a network deployment are entitled to its
+corresponding source — this repository. See [`NOTICE.md`](NOTICE.md) for the
+full attribution and source-availability notice and [`LICENSE`](LICENSE) for the
+license text.
 
----
-
-## Data Sources
-
-WorldMonitor aggregates attributed upstream sources across geopolitics, finance, energy, climate, aviation, cyber, military, infrastructure, and news intelligence. Curated feeds and freshness-tracked source groups are published in the full [data sources catalog](https://www.worldmonitor.app/docs/data-sources), with provider, feed-tier, license-posture, and collection-method details.
-
----
-
-## Contributing
-
-Contributions welcome! See [CONTRIBUTING.md](./CONTRIBUTING.md) for guidelines.
-
-```bash
-npm run typecheck        # Type checking
-npm run build:full       # Production build
-```
-
----
-
-## License
-
-**AGPL-3.0-only** for the source code. Commercial use is permitted under the AGPL when you comply with its copyleft and source-availability terms.
-
-| Use Case | Allowed? |
-|----------|----------|
-| Personal / research / educational | Yes, under AGPL-3.0-only |
-| Self-hosted instance | Yes, under AGPL-3.0-only |
-| Fork and modify | Yes, share source under AGPL-3.0-only when required |
-| Commercial use / SaaS | Yes, under AGPL-3.0-only when you comply with AGPL obligations |
-| Private-source proprietary use or official branding rights | Separate commercial or trademark permission needed |
-
-See [LICENSE](LICENSE) for the full code license and [docs/license.mdx](docs/license.mdx) for a plain-language summary. Commercial licensing is available as an alternative option for teams that need non-AGPL terms.
-
-Copyright (C) 2024-2026 Elie Habib. All rights reserved.
-
----
-
-## Author
-
-**Elie Habib** — [GitHub](https://github.com/koala73)
-
-## Contributors
-
-<a href="https://github.com/koala73/worldmonitor/graphs/contributors">
-  <img src="https://contrib.rocks/image?repo=koala73/worldmonitor" />
-</a>
-
-## Security Acknowledgments
-
-We thank the following researchers for responsibly disclosing security issues:
-
-- **Cody Richard** — Disclosed three security findings covering IPC command exposure, renderer-to-sidecar trust boundary analysis, and fetch patch credential injection architecture (2026)
-
-See our [Security Policy](./SECURITY.md) for responsible disclosure guidelines.
-
----
-
-<p align="center">
-  <a href="https://www.worldmonitor.app">worldmonitor.app</a> &nbsp;·&nbsp;
-  <a href="https://www.worldmonitor.app/docs/documentation">docs.worldmonitor.app</a> &nbsp;·&nbsp;
-  <a href="https://finance.worldmonitor.app">finance.worldmonitor.app</a> &nbsp;·&nbsp;
-  <a href="https://commodity.worldmonitor.app">commodity.worldmonitor.app</a>
-</p>
-
-## Star History
-
-<a href="https://star-history.dera.page/#koala73/worldmonitor&type=Date">
- <picture>
-   <source media="(prefers-color-scheme: dark)" srcset="https://star-history.dera.page/svg?repos=koala73/worldmonitor&type=Date&theme=dark" />
-   <img alt="Star History Chart" src="https://star-history.dera.page/svg?repos=koala73/worldmonitor&type=Date" />
- </picture>
-</a>
+- Upstream project: [koala73/worldmonitor](https://github.com/koala73/worldmonitor) (AGPL-3.0)
+- Derivative work: **Ai Nomads World Command Center**, by Eddie Ruiz ([@ed1868](https://github.com/ed1868))
