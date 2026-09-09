@@ -58,12 +58,14 @@ const INSTRUCTIONS = [
   'For "show me all air traffic", "show every plane", "put the planes on the map": call show_air_traffic{enabled:true} — it live-renders every transponder in view and keeps refreshing. "Hide air traffic" turns it off.',
   'For live CITY camera requests — "show me Tel Aviv live", "eyes on Kyiv", "any cameras in Tokyo" — call watch_camera with the place coordinates. It selects and starts the nearest live city cam. If the result lists availableCameras instead, read a few of those city names to the operator.',
   'For TRAFFIC / freeway / street camera requests — "show me traffic cams in LA", "freeway cameras in the Bay Area", "street cameras in London" — call show_traffic_cameras with the place coordinates. It puts thousands of live public traffic cams on the map as clickable markers. Report how many are there. Coverage is California, Florida, and London — if the count is 0, say so.',
+  'For a CAMERA WALL — "put Miami, Times Square, and Tokyo on the wall", "show me these cities side by side" — call show_camera_wall with each place\'s coordinates. It opens a live grid. City-cam coverage: Kyiv, Italy, NYC, Chicago, Miami, Key West, Taipei, Tokyo, Sydney.',
   'For "show/hide <data> on the map" requests, call set_map_layer. Military aircraft = "military"; ships/vessels = "ais"; wildfires = "fires"; live cameras = "webcams"; satellites = "satellites".',
   'For time-window requests ("last 24 hours", "past week"), call set_time_range.',
   'For requests about a dashboard section ("show me the news panel", "bring up markets"), call open_panel.',
   'For questions like "what am I looking at?" call get_view_state first, then answer from it.',
   'For "what\'s in the air / any military activity" call get_flight_overview. For headlines call get_news_headlines. For earthquakes call get_earthquakes. For "how are the markets" call get_market_summary.',
   'For "give me the brief / situation report / brief me / what is happening in the world" call situation_brief, then deliver a crisp spoken mission-control situation report: open with the single most significant item, then move briskly through air, seismic, markets, and conflict hotspots. Synthesize — never read every field. Keep it tight.',
+  'For a DEEP-DIVE on a place/conflict/topic — "what\'s happening in the Red Sea?", "situation in Taiwan", "brief me on the Sahel" — call get_hotspot_context with the topic, explain the situation factually from the headlines, and annotate_map the key places as you talk. Then offer to fly there.',
   'ANALYTICAL questions — counts, biggest/strongest/highest, or nearest over an area — call analyst_query. Pick domain flights|earthquakes|fires. For "near <place>" pass near{lat,lon,radiusKm}; for a named region ("over Texas") pass a bbox you derive yourself. Examples: "how many flights over Texas above 30,000 feet" → domain:flights, bbox for Texas, minAltitudeFt:30000, aggregate:count. "Biggest fire near LA" → domain:fires, near LA, aggregate:extreme. "Strongest quake in Japan this week" → domain:earthquakes, bbox Japan, aggregate:extreme. For a follow-up about the SAME set ("which of those is closest to me?") pass followUp:true with a new near/aggregate. State counts verbatim and name the top few results with their key numbers.',
   'For "when can I see the space station / next ISS pass / is the ISS overhead" call next_iss_pass with the location coordinates. Report the local time, how many minutes away, how long it is visible, and how high it climbs (maxElevationDeg — over 40° is a great pass). Convert the UTC time to the operator\'s local time.',
   'For "next rocket launch / upcoming launches / when does SpaceX launch next" call get_rocket_launches. Lead with the soonest, give vehicle + mission + local launch time, and offer to fly to the pad (each has lat/lon).',
@@ -326,6 +328,32 @@ const TOOLS: VoiceToolDefinition[] = [
         place: { type: 'string', description: 'Place name, e.g. "Los Angeles"' },
       },
       required: ['lat', 'lon'],
+    },
+  },
+  {
+    type: 'function',
+    name: 'show_camera_wall',
+    description: 'Open a surveillance WALL — several live city cameras playing at once in a grid. Use for "put X, Y, Z on the wall", "show me these cities side by side", "camera wall of ...". Supply 2–9 places with their coordinates.',
+    parameters: {
+      type: 'object',
+      properties: {
+        cameras: {
+          type: 'array',
+          description: '2–9 places to show on the wall.',
+          items: { type: 'object', properties: { lat: { type: 'number' }, lon: { type: 'number' }, label: { type: 'string' } }, required: ['lat', 'lon'] },
+        },
+      },
+      required: ['cameras'],
+    },
+  },
+  {
+    type: 'function',
+    name: 'get_hotspot_context',
+    description: 'Deep-dive a place, conflict, or topic: pulls the matching live news headlines + clusters + any geo, so you can explain the situation and annotate the map. Use for "what\'s happening in the Red Sea?", "situation in Taiwan", "brief me on the Sahel", "deep dive on <topic>".',
+    parameters: {
+      type: 'object',
+      properties: { query: { type: 'string', description: 'The place, conflict, or topic' } },
+      required: ['query'],
     },
   },
   {
@@ -753,6 +781,30 @@ export function createVoiceActionRegistry(ctx: AppContext): VoiceActionRegistry 
       };
     },
 
+    async show_camera_wall({ cameras }) {
+      const reqs = Array.isArray(cameras) ? cameras as Array<{ lat: number; lon: number; label?: string }> : [];
+      const valid = reqs.filter((c) => typeof c.lat === 'number' && typeof c.lon === 'number').slice(0, 9);
+      if (valid.length < 1) return { ok: false, error: 'Provide 2–9 places with coordinates' };
+      const [{ openCameraWall }, { CITY_CAMS }, { fetchLiveVideoInfo }] = await Promise.all([
+        import('@/components/CameraWall'),
+        import('@/services/city-cams'),
+        import('@/services/live-news'),
+      ]);
+      const sources = await Promise.all(valid.map(async (c) => {
+        const nearest = CITY_CAMS
+          .map((cc) => ({ ...cc, distKm: Math.hypot(cc.lat - c.lat, cc.lon - c.lon) * 111 }))
+          .sort((a, b) => a.distKm - b.distKm)[0];
+        if (!nearest || nearest.distKm > 900) return null;
+        let videoId = nearest.fallback;
+        try { const info = await fetchLiveVideoInfo(nearest.handle); if (info.videoId) videoId = info.videoId; } catch { /* fallback */ }
+        return { title: c.label || nearest.city, youtubeId: videoId };
+      }));
+      const wall = sources.filter((s): s is { title: string; youtubeId: string } => s !== null);
+      if (!wall.length) return { ok: false, error: 'No live city cameras near those places (coverage is major cities)' };
+      openCameraWall('Camera Wall', wall);
+      return { ok: true, count: wall.length, cameras: wall.map((s) => s.title) };
+    },
+
     async show_traffic_cameras({ lat, lon, place }) {
       if (typeof lat !== 'number' || typeof lon !== 'number') {
         return { ok: false, error: 'Missing coordinates' };
@@ -789,6 +841,37 @@ export function createVoiceActionRegistry(ctx: AppContext): VoiceActionRegistry 
         .slice(0, max)
         .map((n) => ({ title: n.title, source: n.source, alert: n.isAlert }));
       return { ok: true, count: items.length, totalLoaded: ctx.allNews.length, headlines: items };
+    },
+
+    get_hotspot_context({ query }) {
+      const q = String(query ?? '').toLowerCase().trim();
+      if (!q) return { ok: false, error: 'No topic' };
+      const terms = q.split(/\s+/).filter((t) => t.length > 2);
+      const matches = (title: string): boolean => {
+        const t = title.toLowerCase();
+        return terms.length ? terms.some((term) => t.includes(term)) : t.includes(q);
+      };
+      const items = [...ctx.allNews]
+        .filter((n) => matches(n.title))
+        .sort((a, b) => Number(b.isAlert) - Number(a.isAlert) || b.pubDate.getTime() - a.pubDate.getTime())
+        .slice(0, 10);
+      const clusters = (ctx.latestClusters ?? [])
+        .filter((c) => matches(c.primaryTitle))
+        .slice(0, 4)
+        .map((c) => ({ headline: c.primaryTitle, publishers: c.uniquePublisherCount ?? c.sourceCount }));
+      const locations = items
+        .filter((n) => typeof n.lat === 'number' && typeof n.lon === 'number')
+        .slice(0, 5)
+        .map((n) => ({ lat: n.lat, lon: n.lon }));
+      return {
+        ok: true,
+        topic: q,
+        matchCount: items.length,
+        headlines: items.slice(0, 8).map((n) => ({ title: n.title, source: n.source, alert: n.isAlert })),
+        clusters,
+        locationsFound: locations,
+        note: 'Explain the situation from these headlines — synthesize a factual 2–4 sentence read, do not list every one. Then call annotate_map to mark the key places you mention (supply coordinates from your own geography knowledge). If matchCount is 0, say the feeds have nothing specific right now and answer from your own knowledge.',
+      };
     },
 
     async get_earthquakes({ minMagnitude }) {
